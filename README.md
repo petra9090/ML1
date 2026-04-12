@@ -1,6 +1,3 @@
-
-```r 
-
 # Hospitality Management
 
 This analysis is based on a hotel booking demand dataset coming from https://www.sciencedirect.com/science/article/pii/S2352340918315191?via%3Dihub#ab0010. 
@@ -48,7 +45,7 @@ all data elements pertaining hotel or custumer identification were deleted.
 |reservation_status             |character | Reservation last status, assuming one of three categories:<br>Canceled – booking was canceled by the customer;<br>Check-Out – customer has checked in but already departed;<br>No-Show – customer did not check-in and did inform the hotel of the reason why |
 |reservation_status_date        |double    | Date at which the last status was set. This variable can be used in conjunction with the ReservationStatus to understand when was the booking canceled or when did the customer checked-out of the hotel|
 
-  r ```
+
 
   
   
