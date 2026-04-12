@@ -1,0 +1,81 @@
+---
+title: "Hotel Management"
+author: "Petronela Tabalae, Divya Shori, Lorena Zovkic"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+
+
+
+```{r libraries setup, include = FALSE}
+
+# Load all libraries at the start
+library(tidyverse)  # Loads a collection of core packages for data science and visualization
+library(readr) 
+library(httr) 
+library(jsonlite) 
+library(dplyr)
+library(lubridate)
+
+
+# Get the hotel data 
+
+hotel_data <- read_csv(
+  "H2.csv",
+  na = c("NULL", "NA", ""),
+  trim_ws = TRUE
+)
+
+head(hotel_data)
+
+# Fetch weather data
+
+url <- "https://archive-api.open-meteo.com/v1/archive?latitude=38.72&longitude=-9.13&start_date=2015-01-01&end_date=2017-12-31&daily=temperature_2m_mean,precipitation_sum,sunshine_duration&timezone=Europe/Lisbon"
+
+response <- GET(url) 
+
+weather_raw <- fromJSON(content(response, "text", encoding = "UTF-8"))
+
+weather_daily <- as_tibble(weather_raw$daily) |>
+  mutate(time = as.Date(time))
+ 
+weather_monthly <- weather_daily |>
+  mutate(
+    year  = year(time),
+    month = month.name[month(time)]
+  ) |>
+  group_by(year, month) |>
+  summarise(
+    avg_temp_c       = mean(temperature_2m_mean, na.rm = TRUE),
+    precipitation_mm = sum(precipitation_sum,    na.rm = TRUE),
+    sunshine_hours   = sum(sunshine_duration,    na.rm = TRUE) / 3600,
+    .groups = "drop"
+  )
+
+#Join the hotel data
+
+hotel_data <- hotel_data %>% 
+  left_join(weather_monthly, 
+            by = c("ArrivalDateYear" = "year", 
+                   "ArrivalDateMonth" = "month")) 
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+Something about why did we choose to analyse this and why it is important
+
+# Research questions
+
+- No show: predicting Cancellations using LM
+
