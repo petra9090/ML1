@@ -8,7 +8,7 @@ output:
     toc_depth: 3
     toc_float: true
     number_sections: true
-    code_folding: show
+    code_folding: hide
     theme: flatly
     df_print: paged
 ---
@@ -109,6 +109,8 @@ hotel_data <- hotel_data %>%
   )
 
 cat("Dataset ready:", nrow(hotel_data), "bookings,", ncol(hotel_data), "variables\n")
+mean_lt   <- round(mean(hotel_data$LeadTime), 1)
+mean_temp <- round(mean(hotel_data$avg_temp_c, na.rm = TRUE), 1)
 ```
 
 ---
@@ -125,6 +127,301 @@ To address these questions, six modelling approaches are applied: a Linear Model
 
 ---
 
+
+ 
+# Exploratory Data Analysis
+ 
+Understanding the data before modelling is not a preliminary step — it is the foundation of every decision that follows. This section examines what the dataset contains, what patterns emerge without any modelling assumptions, and what we found that required attention before the data could be used reliably. The findings here directly inform all preprocessing and modelling choices in the sections that follow.
+ 
+---
+ 
+## What Is in the Data?
+ 
+The dataset covers 79,330 city hotel bookings from a single Lisbon property, recorded between July 2015 and August 2017. Each row represents one booking and carries information across four broad areas: who made the booking (guest type, origin, repeat status), how it was made (channel, agent, lead time), what was booked (room type, meal plan, special requests), and what happened (price paid, stay length, whether it was cancelled).
+ 
+```{r eda-snapshot, echo=FALSE}
+snapshot <- data.frame(
+  Area = c("Who booked",
+           "How it was booked",
+           "What was booked",
+           "What happened",
+           "When they arrived",
+           "Complementary weather"),
+  Key_Variables = c(
+    "CustomerType, Country, Adults, Children, Babies, IsRepeatedGuest",
+    "MarketSegment, DistributionChannel, Agent, LeadTime, DepositType",
+    "ReservedRoomType, Meal, TotalOfSpecialRequests, RequiredCarParkingSpaces",
+    "IsCanceled, ADR, StaysInWeekendNights, StaysInWeekNights",
+    "ArrivalDateYear, ArrivalDateMonth, arrival_season",
+    "avg_temp_c, precipitation_mm, sunshine_hours"
+  ),
+  Notes = c(
+    "74.9% Transient; 39% from Portugal",
+    "48.9% Online TA; median lead time 74 days",
+    "BB meal plan = 78.5% of bookings",
+    "41.7% cancelled; median ADR €100",
+    "2015–2017; August is busiest month",
+    "Joined from Open-Meteo API on arrival month"
+  )
+)
+ 
+kable(snapshot,
+      caption = "Table 1: Dataset structure — 79,330 bookings, 31 variables across six areas.",
+      col.names = c("Area", "Key Variables", "Notable Facts")) %>%
+  kable_styling(full_width = TRUE, font_size = 11) %>%
+  row_spec(0, bold = TRUE)
+```
+ 
+Three variables are excluded before any analysis begins. `ReservationStatus` and `ReservationStatusDate` directly encode the cancellation outcome and would constitute data leakage in any predictive model. `Company` is missing for 94.7% of bookings and carries no usable signal.
+ 
+---
+ 
+## How Are Bookings Distributed Over Time?
+ 
+Demand is not uniform across the year. August is the busiest month by a considerable margin, and 2016 accounts for the largest share of bookings across the three years. This temporal structure has two implications: seasonal patterns are a genuine feature of the data, not noise, and any model that ignores seasonality is likely to underperform.
+ 
+```{r eda-temporal, fig.cap="Figure EDA-1: Monthly booking volume across 2015–2017. August consistently peaks each year, while January and December are the quietest months. The seasonal rhythm is stable across all three years, confirming that arrival season is a reliable and meaningful predictor for all models."}
+ 
+hotel_data %>%
+  mutate(
+    ArrivalDateMonth = factor(ArrivalDateMonth, levels = month.name),
+    Year = factor(ArrivalDateYear)
+  ) %>%
+  count(ArrivalDateMonth, Year) %>%
+  ggplot(aes(x = ArrivalDateMonth, y = n, colour = Year, group = Year)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  scale_colour_manual(values = c("2015" = "#2166ac",
+                                  "2016" = "#4dac26",
+                                  "2017" = "#d01c8b")) +
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  labs(
+    title    = "Monthly Booking Volume by Year",
+    subtitle = "Consistent seasonal pattern across all three years",
+    x = NULL, y = "Number of Bookings", colour = "Year"
+  ) +
+  theme_minimal(base_size = 11)
+```
+ 
+---
+ 
+## What Does the Typical Booking Look Like?
+ 
+Before exploring variation, it helps to establish what a typical booking in this dataset looks like. The median guest books 74 days in advance, stays 3 nights, pays €100 per night, and does not cancel. That is the baseline. Everything the models do is an attempt to explain departures from that baseline.
+ 
+```{r eda-distributions, fig.cap="Figure EDA-2: Distributions of the four core numeric variables. ADR and lead time are right-skewed with long upper tails, indicating that log-transformation or careful scaling will be needed before modelling. Total nights and special requests are discrete counts concentrated at low values, consistent with count distributions.", fig.height=5}
+ 
+p1 <- ggplot(hotel_data %>% filter(ADR > 0, ADR < 500), aes(x = ADR)) +
+  geom_histogram(bins = 60, fill = "steelblue", colour = "white", alpha = 0.85) +
+  geom_vline(xintercept = median(hotel_data$ADR[hotel_data$ADR > 0]),
+             linetype = "dashed", colour = "darkred", linewidth = 0.8) +
+  annotate("text", x = median(hotel_data$ADR[hotel_data$ADR > 0]) + 20,
+           y = Inf, vjust = 2,
+           label = paste0("Median €", median(hotel_data$ADR[hotel_data$ADR > 0])),
+           size = 3, colour = "darkred") +
+  scale_x_continuous(labels = dollar_format(prefix = "€")) +
+  labs(title = "Room Price (ADR)", x = "€/night", y = "Count") +
+  theme_minimal(base_size = 10)
+ 
+p2 <- ggplot(hotel_data, aes(x = LeadTime)) +
+  geom_histogram(bins = 60, fill = "darkorange", colour = "white", alpha = 0.85) +
+  geom_vline(xintercept = median(hotel_data$LeadTime),
+             linetype = "dashed", colour = "darkred", linewidth = 0.8) +
+  annotate("text", x = median(hotel_data$LeadTime) + 20,
+           y = Inf, vjust = 2,
+           label = paste0("Median ", median(hotel_data$LeadTime), " days"),
+           size = 3, colour = "darkred") +
+  labs(title = "Lead Time", x = "Days before arrival", y = "Count") +
+  theme_minimal(base_size = 10)
+ 
+p3 <- hotel_data %>%
+  filter(total_stays > 0, total_stays <= 12) %>%
+  count(total_stays) %>%
+  ggplot(aes(x = total_stays, y = n)) +
+  geom_col(fill = "seagreen", colour = "white", alpha = 0.85) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(title = "Total Nights Booked", x = "Nights", y = "Count") +
+  theme_minimal(base_size = 10)
+ 
+p4 <- hotel_data %>%
+  count(TotalOfSpecialRequests) %>%
+  ggplot(aes(x = TotalOfSpecialRequests, y = n)) +
+  geom_col(fill = "mediumpurple", colour = "white", alpha = 0.85) +
+  scale_x_continuous(breaks = 0:5) +
+  labs(title = "Special Requests", x = "Number of requests", y = "Count") +
+  theme_minimal(base_size = 10)
+ 
+(p1 + p2) / (p3 + p4)
+```
+ 
+---
+ 
+## Where Does the Variation Come From?
+ 
+The most important question in EDA is not what the average looks like — it is what drives variation. We found that market segment is by far the most powerful organising variable in this dataset. It separates bookings by price, stay length, and cancellation rate simultaneously.
+ 
+```{r eda-segment-overview, fig.cap="Figure EDA-3: Mean ADR (€), mean stay length (nights), and cancellation rate by market segment. Online TA dominates volume at 48.9% of bookings. Direct bookings command the highest average price. Corporate guests stay the shortest. Groups cancel at nearly 69%. These three dimensions — price, stay length, cancellation — define the three core research questions of this project."}
+ 
+seg_summary <- hotel_data %>%
+  filter(!as.character(MarketSegment) %in% c("Undefined")) %>%
+  group_by(MarketSegment) %>%
+  summarise(
+    mean_adr       = mean(ADR[ADR > 0], na.rm = TRUE),
+    mean_stays     = mean(total_stays[total_stays > 0], na.rm = TRUE),
+    cancel_rate    = mean(IsCanceled),
+    n              = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(share = n / sum(n))
+ 
+p_adr_seg <- ggplot(seg_summary,
+                    aes(x = reorder(as.character(MarketSegment), mean_adr),
+                        y = mean_adr, fill = as.character(MarketSegment))) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = paste0("€", round(mean_adr))),
+            hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(limits = c(0, 145)) +
+  labs(title = "Mean ADR", x = NULL, y = "€/night") +
+  theme_minimal(base_size = 10)
+ 
+p_stays_seg <- ggplot(seg_summary,
+                      aes(x = reorder(as.character(MarketSegment), mean_adr),
+                          y = mean_stays, fill = as.character(MarketSegment))) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = round(mean_stays, 1)),
+            hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(limits = c(0, 5)) +
+  labs(title = "Mean Stay Length", x = NULL, y = "Nights") +
+  theme_minimal(base_size = 10)
+ 
+p_cancel_seg <- ggplot(seg_summary,
+                       aes(x = reorder(as.character(MarketSegment), mean_adr),
+                           y = cancel_rate, fill = as.character(MarketSegment))) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = scales::percent(cancel_rate, accuracy = 0.1)),
+            hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = scales::percent_format(),
+                     limits = c(0, 0.95)) +
+  labs(title = "Cancellation Rate", x = NULL, y = NULL) +
+  theme_minimal(base_size = 10)
+ 
+p_adr_seg + p_stays_seg + p_cancel_seg
+```
+ 
+---
+ 
+## What Data Quality Issues Did We Find?
+ 
+Three issues required specific attention and shaped how the data was prepared for modelling.
+ 
+**Issue 1 — Zero ADR records.** 1,208 bookings (1.5%) have an ADR of zero. These are complimentary rooms — provided free of charge — and are not reflective of market pricing. Including them would distort any model of room price. They are excluded from the Linear Model but retained in classification models where price is a predictor rather than the outcome.
+ 
+**Issue 2 — The Non Refund deposit paradox.** Bookings with a Non Refund deposit show a 99.8% cancellation rate across 12,868 records. This is almost certainly not genuine guest behaviour — it likely reflects a recording convention where no-shows or agent-initiated cancellations are logged as cancelled regardless of whether payment was collected. This variable is included in the classification models but flagged explicitly; its coefficient should not be interpreted causally.
+ 
+**Issue 3 — Skewness in key variables.** ADR and lead time are both strongly right-skewed. ADR is log-transformed for the Linear Model. Lead time and temperature are mean-centred before modelling so that model intercepts represent the most common booking profile rather than an impossible baseline of zero days and zero degrees.
+ 
+```{r eda-quality, fig.cap="Figure EDA-4: Cancellation rate by deposit type (left) and ADR distribution highlighting zero-price bookings (right). The near-100% cancellation rate for Non Refund deposits and the cluster of zero-ADR bookings are the two most important data quality findings — both are addressed in data preparation before any model is fitted."}
+ 
+p_dep <- hotel_data %>%
+  group_by(DepositType) %>%
+  summarise(
+    rate = mean(IsCanceled),
+    n    = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = reorder(DepositType, rate), y = rate, fill = DepositType)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = paste0(scales::percent(rate, accuracy = 0.1),
+                               "\n(n=", scales::comma(n), ")")),
+            hjust = -0.05, size = 3) +
+  coord_flip() +
+  scale_fill_manual(values = c("No Deposit"  = "steelblue",
+                               "Non Refund"  = "tomato",
+                               "Refundable"  = "darkorange")) +
+  scale_y_continuous(labels = scales::percent_format(),
+                     limits = c(0, 1.2)) +
+  labs(title = "Cancellation Rate by Deposit Type",
+       subtitle = "Non Refund = 99.8% — likely a recording artefact",
+       x = NULL, y = "Cancellation Rate") +
+  theme_minimal(base_size = 10)
+ 
+p_zero_adr <- hotel_data %>%
+  mutate(zero_adr = ifelse(ADR == 0, "Zero ADR\n(complimentary)", "ADR > 0")) %>%
+  filter(ADR < 500) %>%
+  ggplot(aes(x = ADR, fill = zero_adr)) +
+  geom_histogram(bins = 70, colour = "white", alpha = 0.85) +
+  scale_fill_manual(values = c("Zero ADR\n(complimentary)" = "tomato",
+                               "ADR > 0" = "steelblue"),
+                    name = NULL) +
+  scale_x_continuous(labels = dollar_format(prefix = "€")) +
+  labs(title = "ADR Distribution",
+       subtitle = "1,208 zero-ADR bookings excluded from Linear Model",
+       x = "ADR (€/night)", y = "Count") +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "top")
+ 
+p_dep + p_zero_adr
+```
+ 
+---
+ 
+## How Does Cancellation Vary With Lead Time?
+ 
+One relationship in the data stands out as particularly striking and has direct implications for how models are specified. The probability of cancellation is not a straight line — it rises sharply with lead time up to around 150 days, then begins to plateau. A guest who books 200 days in advance is far more likely to cancel than one who books a week out.
+ 
+```{r eda-leadtime, fig.cap="Figure EDA-5: Estimated cancellation probability as a function of lead time, fitted with a LOESS smoother. The relationship is clearly nonlinear — risk rises steeply for bookings made more than 30 days in advance before levelling off. A straight line would substantially misrepresent this pattern."}
+ 
+hotel_data %>%
+  ggplot(aes(x = LeadTime, y = IsCanceled)) +
+  geom_smooth(method = "loess", span = 0.35,
+              colour = "steelblue", fill = "lightblue",
+              linewidth = 1.2) +
+  geom_hline(yintercept = mean(hotel_data$IsCanceled),
+             linetype = "dashed", colour = "darkred", linewidth = 0.7) +
+  annotate("text", x = 420,
+           y = mean(hotel_data$IsCanceled) + 0.03,
+           label = paste0("Overall rate = ",
+                          scales::percent(mean(hotel_data$IsCanceled),
+                                          accuracy = 0.1)),
+           colour = "darkred", size = 3.2) +
+  scale_x_continuous(limits = c(0, 500)) +
+  scale_y_continuous(labels = scales::percent_format(),
+                     limits = c(0, 0.85)) +
+  labs(
+    title    = "Cancellation Probability by Lead Time",
+    subtitle = "LOESS smoother — the nonlinear shape is a genuine feature of the data",
+    x = "Lead Time (days before arrival)",
+    y = "Estimated Cancellation Probability"
+  ) +
+  theme_minimal(base_size = 11)
+```
+ 
+---
+ 
+## What This Means for Data Preparation
+ 
+The EDA surfaces five decisions that carry through to every model in this report:
+ 
+**1. Log-transform ADR.** The right-skewed distribution of room price requires a log-transformation before it can serve as a response variable in the Linear Model.
+ 
+**2. Remove zero-ADR records from pricing models.** Complimentary bookings are not priced by the market and would distort any model predicting room price.
+ 
+**3. Remove same-day bookings from stay-length models.** 331 bookings with zero total nights are excluded from the Poisson model as they represent no meaningful stay.
+ 
+**4. Centre continuous predictors.** Lead time and temperature are mean-centred before modelling so intercepts are interpretable at the most common booking profile.
+ 
+**5. Treat Non Refund deposit with caution.** Its near-perfect association with cancellation reflects a data recording issue, not a causal relationship. It is included as a predictor but not interpreted causally.
+ 
+These five decisions are applied in the preprocessing step before any model is fitted and remain consistent across all six models that follow.
+ 
+---
+
 # Model 1: Linear Model — What Drives Room Price?
 
 *Section lead: Divya Shori*
@@ -133,11 +430,19 @@ To address these questions, six modelling approaches are applied: a Linear Model
 
 > **Can we predict the room price for an incoming booking, and which factors drive the most meaningful price variation?**
 
-Room price — measured as Average Daily Rate (ADR, euros per night) — is the primary lever through which hotels manage revenue. A model that accurately predicts ADR from a booking profile at the time of enquiry has direct commercial value: it allows revenue managers to assess whether a price offer is appropriate, identify which market channels yield the highest rates, and understand how lead time, seasonality, and weather interact to shape pricing.
+Room price measured as Average Daily Rate (ADR, euros per night), is the primary lever through which hotels manage revenue. Understanding what drives ADR matters because even small systematic differences in pricing across segments or seasons can translate into significant revenue at scale. This model asks: given everything we know about a booking at the moment it is made, what room price should we expect?
 
-## Why Log-Transform ADR?
+## Why This Model
 
-Before fitting any model, we examine the distribution of the response variable. The raw ADR distribution is substantially right-skewed, with a mean of €105 but a long upper tail extending to €5,400. A log-transformation compresses this tail, produces a near-symmetric distribution, and — critically — satisfies the normality and constant-variance assumptions of the Linear Model. Coefficients from a log-ADR model are directly interpretable as percentage changes in room price, which is more intuitive than euro-unit effects on a skewed scale.
+The Linear Model is the appropriate starting point for a continuous numeric response variable. ADR is a real-valued amount, and once log-transformed to address skewness, the assumptions of normality and constant variance are reasonably satisfied. The Linear Model also produces directly interpretable coefficients, each one tells us the percentage change in room price associated with a one-unit change in a predictor, holding everything else constant. This transparency is a significant advantage over more complex models.
+
+## Data Preparation
+
+Two subsets of the data are excluded before modelling. First, 1,208 bookings with an ADR of zero are removed, these represent complimentary rooms and do not reflect market pricing. Second, the Complementary and Undefined market segments are excluded for the same reason. The remaining 78,120 bookings form the modelling dataset.
+
+The response variable ADR is log-transformed. The raw distribution is strongly right-skewed, a mean of €105 with a tail extending to €5,400, which would violate the normality assumption of the Linear Model. Log-transformation produces a near-symmetric distribution and makes coefficients interpretable as multiplicative percentage effects on price, which is more intuitive for a business audience than raw euro-unit effects.
+
+Two continuous predictors are mean-centred before fitting: lead time (mean = `r mean_lt` days) and monthly temperature (mean = `r mean_temp`°C). Centring ensures the model intercept has a meaningful interpretation — the expected room price for the most common booking profile at average lead time and average temperature — rather than an extrapolation to impossible values like zero days or zero degrees.
 
 ```{r lm-motivation-plot, fig.cap="Figure 1: Raw ADR (left) is strongly right-skewed with a long upper tail, violating the normality assumption of the Linear Model. After log-transformation (right), the distribution is approximately symmetric and unimodal — confirming that log(ADR) is the appropriate response variable."}
 
@@ -291,6 +596,16 @@ ggplot(drop1_df, aes(x = `F value`, y = reorder(Predictor, `F value`))) +
   theme(legend.position = "top")
 ```
 
+## Key Results
+
+The `drop1()` test confirms that every predictor in the model contributes significantly, none can be removed without meaningfully worsening fit. The strongest predictors are market segment, room type, and arrival season, consistent with the exploratory analysis. Lead time and temperature, while smaller in absolute effect, are both statistically robust and carry practical significance.
+
+Three findings stand out for interpretation. First, market segment is the single largest 
+driver of price variation: Direct bookings command the highest rates, while Corporate and 
+Group bookings anchor the lower end — reflecting the commission pressure and volume 
+discounts associated with intermediary and group channels respectively. Second, Summer 
+arrivals attract a meaningful price premium over other seasons, consistent with peak leisure demand in Lisbon. Third, each additional day of lead time is associated with a small but consistent decrease in room price, suggesting that guests who book early secure better rates, a pattern the hotel could leverage through targeted early-booking promotions.
+
 ## The Unique Effect of Lead Time: Added-Variable Plot
 
 A coefficient in a multiple regression reflects the effect of a predictor *after accounting for all other predictors*. To visualise this unambiguously for lead time — the most actionable predictor for pricing strategy — we construct an **added-variable (partial regression) plot**. This plot shows the residual variation in log(ADR) that cannot be explained by any other predictor in the model, plotted against the residual variation in lead time after removing the same set of predictors. The slope of the relationship is therefore the pure, isolated effect of lead time on price.
@@ -415,7 +730,10 @@ data.frame(predicted = pred_lm, observed = test_lm$log_adr) %>%
   theme_minimal(base_size = 11)
 ```
 
-The Linear Model explains `r round(summary(model_lm)$adj.r.squared * 100, 1)`% of variance in log(ADR) on the training set, with an out-of-sample R² of `r round(r2_test, 3)` and a practical prediction error of approximately ±€`r round(abs(rmse_eur), 1)` per night. A revenue manager could use the model to flag bookings where the proposed rate sits more than one standard error above or below the prediction, triggering a manual pricing review.
+## Business Takeaway
+
+The Linear Model explains `r round(summary(model_lm)$adj.r.squared * 100, 1)`% of variance in log(ADR) on the training set, with an out-of-sample R² of `r round(r2_test, 3)` and a practical prediction error of approximately ±€`r round(abs(rmse_eur), 1)` per night.  The model explains a substantial proportion of room price variance and predicts unseen bookings to within approximately ±€`r round(abs(rmse_eur), 1)` per night. For a revenue manager, this has two direct applications. First, the model can serve as a real-time pricing benchmark: any incoming booking can be scored against the model's prediction, and bookings where the proposed rate deviates significantly from the prediction can be flagged for manual review. Second, the segment and season coefficients provide a clear, data-driven basis for setting differential pricing strategies — knowing that Direct bookings sustain higher rates than Online TA, for instance, justifies investing in direct channel marketing to shift the booking mix toward higher-margin customers.
+
 
 ---
 
@@ -427,7 +745,18 @@ The Linear Model explains `r round(summary(model_lm)$adj.r.squared * 100, 1)`% o
 
 > **Which guest segments and booking characteristics predict longer stays, and can we quantify the premium value of high-stay-length segments?**
 
-Length of stay directly determines booking revenue: all else equal, a guest who stays four nights generates twice the revenue of a guest who stays two. `total_stays` (weekend plus weekday nights) is a non-negative integer count variable with a mean of `r round(mean(hotel_data$total_stays), 2)` nights. A Poisson GLM is the natural choice: it models a log-linear relationship between predictors and expected count, and naturally enforces non-negative predictions.
+Length of stay is one of the most underused levers in hotel revenue management. A guest who stays four nights generates roughly twice the revenue of a guest who stays two, with lower relative operational cost per night. Yet marketing and channel strategies are rarely optimised for stay length, most focus on cancellation or price. This model asks: which types of guests book the longest stays, and can we identify the segments most worth targeting for long-stay promotions?
+
+## Why This Model
+
+Total nights booked (`total_stays`) is a non-negative integer count variable. A standard 
+Linear Model is inappropriate for count data — it can predict negative values and does not respect the discrete, bounded nature of the response. The Poisson Generalised Linear Model is designed for exactly this type of outcome: it models the log of the expected count as a linear function of predictors, guaranteeing non-negative predictions and producing coefficients interpretable as multiplicative rate ratios. Before accepting the Poisson assumption however, we formally test whether the data are overdispersed — a common violation in real-world count data that requires a correction.
+
+## Data Preparation
+
+Bookings with zero total nights (n = 331, likely same-day cancellations or data entry 
+errors) are excluded from the analysis, as a zero-night stay cannot be meaningfully 
+modelled as a count outcome. The two remaining observations in the Undefined market segment are also excluded. All other preprocessing — factor relevelling, feature engineering, weather join, was applied in the shared preprocessing step above.
 
 ## Count Distribution and Overdispersion Motivation
 
@@ -542,6 +871,18 @@ anova(model_null, model_pois, test = "F")
 drop1(model_pois, test = "F")
 ```
 
+## Key Results
+
+The `drop1()` F-tests confirm that market segment, customer type, meal plan, and seasonal conditions all contribute significantly to stay length. The rate ratio forest plot 
+(Figure 10) reveals the direction and magnitude of these effects after controlling for 
+confounders. Corporate and Contract customers book the shortest stays — consistent with 
+single-night business travel — while Aviation and Online TA guests tend toward longer stays. Summer arrivals book longer stays than other seasons, and guests on half-board or full-board meal plans stay notably longer than bed-and-breakfast guests, likely reflecting the commitment of a more structured holiday.
+
+The Tukey pairwise contrasts (Figure 11) show that not all segment differences are 
+statistically distinguishable once multiple comparisons are accounted for. The most 
+robust distinctions are between Corporate and leisure-oriented segments — a finding with 
+direct implications for targeted marketing.
+
 ## Rate Ratio Forest Plot
 
 ```{r poisson-forest, fig.cap="Figure 10: Rate ratios from the quasi-Poisson GLM. Values above 1 indicate longer expected stays than the reference group. Error bars are 95% confidence intervals; blue points are significant at p < 0.05."}
@@ -621,7 +962,7 @@ ggplot(glht_df, aes(x = rr, y = reorder(Contrast, rr), colour = significant)) +
   theme(legend.position = "top")
 ```
 
-## Business Interpretation
+## Business Takeaway
 
 ```{r poisson-test-performance}
 pred_pois <- predict(model_pois, newdata = test_pois, type = "response")
@@ -631,7 +972,8 @@ cat(sprintf("Mean Absolute Error: %.2f nights\n", mae_pois))
 cat(sprintf("RMSE:                %.2f nights\n", rmse_pois))
 ```
 
-The quasi-Poisson model confirms that market segment, customer type, meal plan, and seasonal conditions are all significant predictors of stay length. The practical prediction error of approximately `r round(mae_pois, 1)` nights reflects the inherent heterogeneity of hotel bookings. From a commercial standpoint, the rate ratio estimates directly quantify the revenue implication of targeting different segments — information that can inform channel mix decisions and promotional strategy.
+
+The quasi-Poisson model predicts stay length to within approximately `r round(mae_pois, 1)` nights on the held-out test set — a useful level of accuracy for segment-level planning. The business implication is straightforward: the hotel should prioritise channels and customer types associated with longer stays when capacity allows. Online TA and leisure segments in Summer represent the highest-value long-stay profiles. A targeted promotion, such as a discounted third or fourth night for Online TA bookings made more than 60 days in advance — could meaningfully shift the average stay length upward for this segment, generating incremental revenue with minimal additional operational cost.
 
 ---
 
