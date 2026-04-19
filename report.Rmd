@@ -1,5 +1,5 @@
 ---
-title: "Hotel Management"
+title: " Predicting Hotel Booking Outcomes Using Machine Learning"
 author: "Petronela Tabalae, Divya Shori, Lorena Zovkic"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 output:
@@ -73,9 +73,15 @@ knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
 
 # Introduction
 
-Something about why did we choose to analyse this and why it is important
+The hospitality industry operates under persistent uncertainty. Hotels must commit to staffing levels, room pricing, and inventory decisions well in advance, yet a significant share of bookings are cancelled before arrival. In city hotels particularly, where business and leisure travellers mix and booking patterns are highly seasonal, understanding what drives cancellations — and what shapes guest behaviour more broadly — has direct consequences for revenue management.
 
-# Research questions
+This report presents a machine learning analysis of booking records from a city hotel in Lisbon, Portugal. The data were collected and published by Antonio, Almeida, and Nunes (2019) and cover 79,330 individual reservations made between July 2015 and August 2017. Each record captures the full lifecycle of a booking: when it was made, who made it, what was requested, what was paid, and whether the guest ultimately arrived. To add environmental context, monthly weather observations for Lisbon — temperature, precipitation, and sunshine hours — are incorporated as complementary predictors, sourced from the Open-Meteo historical weather archive.
+
+Three questions motivate the analysis. First, which booking and seasonal characteristics determine the price a guest pays for a room? Second, what kinds of bookings tend to result in longer stays? Third, what information available at the time of booking most reliably predicts whether a reservation will be cancelled?
+
+To address these questions, six modelling approaches are applied: a Linear Model, a Poisson Generalised Linear Model, a Binomial Generalised Linear Model, a Generalised Additive Model, a Support Vector Machine, and a Neural Network. Together, these methods span the range from interpretable parametric models to flexible, data-driven approaches, allowing both explanation and prediction to be evaluated side by side. All models are trained on a held-out split of the data and evaluated on unseen test observations to ensure that reported performance reflects genuine out-of-sample accuracy.
+
+# Research questions (to be added once everyone is complete with the analysis)
 
 - No show: predicting Cancellations using LM
 
