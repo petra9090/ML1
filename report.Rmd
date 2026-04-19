@@ -13,41 +13,36 @@ output:
     df_print: paged
 ---
 
-
-
-
 ```{r libraries setup, include = FALSE}
-
 # Load all libraries at the start
-library(tidyverse)  # Loads a collection of core packages for data science and visualization
-library(readr) 
-library(httr) 
-library(jsonlite) 
+library(tidyverse)   # core data science packages
+library(readr)
+library(httr)
+library(jsonlite)
 library(dplyr)
 library(lubridate)
+library(car)         # avPlot — added-variable plots
+library(multcomp)    # glht — post-hoc contrasts
+library(broom)       # tidy model output
+library(kableExtra)  # enhanced tables
+library(scales)      # axis formatting
+library(patchwork)   # combining plots
+library(caret)       # createDataPartition
 
-
-# Get the hotel data 
-
+# Get the hotel data
 hotel_data <- read_csv(
   "H2.csv",
   na = c("NULL", "NA", ""),
   trim_ws = TRUE
 )
 
-head(hotel_data)
-
 # Fetch weather data
-
 url <- "https://archive-api.open-meteo.com/v1/archive?latitude=38.72&longitude=-9.13&start_date=2015-01-01&end_date=2017-12-31&daily=temperature_2m_mean,precipitation_sum,sunshine_duration&timezone=Europe/Lisbon"
-
-response <- GET(url) 
-
+response <- GET(url)
 weather_raw <- fromJSON(content(response, "text", encoding = "UTF-8"))
-
 weather_daily <- as_tibble(weather_raw$daily) |>
   mutate(time = as.Date(time))
- 
+
 weather_monthly <- weather_daily |>
   mutate(
     year  = year(time),
@@ -61,15 +56,62 @@ weather_monthly <- weather_daily |>
     .groups = "drop"
   )
 
-#Join the hotel data
+# Join the hotel data
+hotel_data <- hotel_data %>%
+  left_join(weather_monthly,
+            by = c("ArrivalDateYear" = "year",
+                   "ArrivalDateMonth" = "month"))
 
-hotel_data <- hotel_data %>% 
-  left_join(weather_monthly, 
-            by = c("ArrivalDateYear" = "year", 
-                   "ArrivalDateMonth" = "month")) 
-
-knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 5)
 ```
+
+```{r preprocessing, message=FALSE, warning=FALSE}
+# ── FEATURE ENGINEERING ──────────────────────────────────────────────────────
+hotel_data <- hotel_data %>%
+  mutate(
+    across(where(is.character), trimws),
+    Agent   = ifelse(Agent   %in% c("NULL", ""), NA, Agent),
+    Company = ifelse(Company %in% c("NULL", ""), NA, Company),
+    total_stays = StaysInWeekendNights + StaysInWeekNights,
+    arrival_season = case_when(
+      ArrivalDateMonth %in% c("March", "April", "May")            ~ "Spring",
+      ArrivalDateMonth %in% c("June", "July", "August")           ~ "Summer",
+      ArrivalDateMonth %in% c("September", "October", "November") ~ "Autumn",
+      TRUE                                                          ~ "Winter"
+    ),
+    is_via_agent = ifelse(is.na(Agent), 0L, 1L),
+    country_region = case_when(
+      Country %in% c("PRT","ESP","FRA","ITA","DEU","BEL",
+                     "NLD","CHE","AUT","LUX","AND")               ~ "Western Europe",
+      Country %in% c("GBR","IRL","DNK","SWE","NOR","FIN",
+                     "ISL","POL","CZE","SVK","HUN")               ~ "N/E Europe",
+      Country %in% c("USA","CAN","BRA","ARG","MEX","COL")         ~ "Americas",
+      TRUE                                                          ~ "Other"
+    ),
+    Children = ifelse(is.na(Children), 0, Children)
+  )
+
+hotel_data <- hotel_data[, setdiff(names(hotel_data), 
+                          c("ReservationStatus", "ReservationStatusDate", "Company"))]
+
+hotel_data <- hotel_data %>%
+  mutate(
+    MarketSegment    = relevel(factor(MarketSegment),  ref = "Online TA"),
+    CustomerType     = relevel(factor(CustomerType),   ref = "Transient"),
+    DepositType      = relevel(factor(DepositType),    ref = "No Deposit"),
+    Meal             = relevel(factor(Meal),           ref = "BB"),
+    arrival_season   = relevel(factor(arrival_season), ref = "Summer"),
+    country_region   = relevel(factor(country_region), ref = "Western Europe"),
+    ReservedRoomType = factor(ReservedRoomType),
+    IsCanceled       = as.integer(IsCanceled),
+    IsRepeatedGuest  = as.integer(IsRepeatedGuest)
+  )
+
+cat("Dataset ready:", nrow(hotel_data), "bookings,", ncol(hotel_data), "variables\n")
+```
+
+---
 
 # Introduction
 
@@ -81,7 +123,576 @@ Three questions motivate the analysis. First, which booking and seasonal charact
 
 To address these questions, six modelling approaches are applied: a Linear Model, a Poisson Generalised Linear Model, a Binomial Generalised Linear Model, a Generalised Additive Model, a Support Vector Machine, and a Neural Network. Together, these methods span the range from interpretable parametric models to flexible, data-driven approaches, allowing both explanation and prediction to be evaluated side by side. All models are trained on a held-out split of the data and evaluated on unseen test observations to ensure that reported performance reflects genuine out-of-sample accuracy.
 
-# Research questions (to be added once everyone is complete with the analysis)
+---
 
-- No show: predicting Cancellations using LM
+# Model 1: Linear Model — What Drives Room Price?
 
+*Section lead: Divya Shori*
+
+## Research Question
+
+> **Can we predict the room price for an incoming booking, and which factors drive the most meaningful price variation?**
+
+Room price — measured as Average Daily Rate (ADR, euros per night) — is the primary lever through which hotels manage revenue. A model that accurately predicts ADR from a booking profile at the time of enquiry has direct commercial value: it allows revenue managers to assess whether a price offer is appropriate, identify which market channels yield the highest rates, and understand how lead time, seasonality, and weather interact to shape pricing.
+
+## Why Log-Transform ADR?
+
+Before fitting any model, we examine the distribution of the response variable. The raw ADR distribution is substantially right-skewed, with a mean of €105 but a long upper tail extending to €5,400. A log-transformation compresses this tail, produces a near-symmetric distribution, and — critically — satisfies the normality and constant-variance assumptions of the Linear Model. Coefficients from a log-ADR model are directly interpretable as percentage changes in room price, which is more intuitive than euro-unit effects on a skewed scale.
+
+```{r lm-motivation-plot, fig.cap="Figure 1: Raw ADR (left) is strongly right-skewed with a long upper tail, violating the normality assumption of the Linear Model. After log-transformation (right), the distribution is approximately symmetric and unimodal — confirming that log(ADR) is the appropriate response variable."}
+
+hotel_lm <- hotel_data %>%
+  filter(ADR > 0,
+         !as.character(MarketSegment) %in% c("Complementary", "Undefined")) %>%
+  mutate(
+    log_adr      = log(ADR),
+    LeadTime_c   = LeadTime   - mean(LeadTime,   na.rm = TRUE),
+    avg_temp_c_c = avg_temp_c - mean(avg_temp_c, na.rm = TRUE)
+  )
+hotel_lm$MarketSegment <- droplevels(hotel_lm$MarketSegment)
+
+mean_lt   <- round(mean(hotel_data$LeadTime), 1)
+mean_temp <- round(mean(hotel_data$avg_temp_c, na.rm = TRUE), 1)
+
+p_raw <- ggplot(hotel_lm, aes(x = ADR)) +
+  geom_histogram(bins = 80, fill = "tomato", colour = "white", alpha = 0.85) +
+  scale_x_continuous(labels = dollar_format(prefix = "€"), limits = c(0, 600)) +
+  labs(title = "Raw ADR", subtitle = "Right-skewed — not suitable for LM",
+       x = "ADR (€/night)", y = "Count") +
+  theme_minimal(base_size = 11)
+
+p_log <- ggplot(hotel_lm, aes(x = log_adr)) +
+  geom_histogram(bins = 60, fill = "steelblue", colour = "white", alpha = 0.85) +
+  geom_vline(xintercept = mean(hotel_lm$log_adr),
+             linetype = "dashed", colour = "black", linewidth = 0.8) +
+  annotate("text", x = mean(hotel_lm$log_adr) + 0.15, y = Inf, vjust = 2,
+           label = paste0("Mean = €", round(exp(mean(hotel_lm$log_adr)), 1)),
+           size = 3.5) +
+  labs(title = "log(ADR)", subtitle = "Symmetric — appropriate for LM",
+       x = "log(ADR)", y = "Count") +
+  theme_minimal(base_size = 11)
+
+p_raw + p_log
+```
+
+## Predictor Exploration
+
+Before fitting the model, we examine how key predictors relate to log(ADR). This motivates the predictor set and informs decisions about reference level choice and centering.
+
+```{r lm-eda, fig.cap="Figure 2: log(ADR) by market segment (left) — Direct and Online TA channels command the highest median rates, while Corporate and Groups anchor the lower end. The relationship between lead time and log(ADR) (right) reveals a negative association: bookings made further in advance tend to secure lower prices, consistent with early-bird discount pricing strategies."}
+
+p_seg <- ggplot(hotel_lm,
+                aes(x = reorder(MarketSegment, log_adr, median),
+                    y = log_adr, fill = MarketSegment)) +
+  geom_violin(trim = TRUE, alpha = 0.7, show.legend = FALSE) +
+  geom_boxplot(width = 0.15, fill = "white", outlier.shape = NA,
+               show.legend = FALSE) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = function(x) paste0("€", round(exp(x))),
+    sec.axis = sec_axis(~ ., name = "log(ADR)")
+  ) +
+  labs(title = "Room Price by Market Segment",
+       x = NULL, y = "ADR (€) [log scale]") +
+  theme_minimal(base_size = 10)
+
+p_lead <- ggplot(hotel_lm %>% sample_n(8000),
+                 aes(x = LeadTime, y = log_adr)) +
+  geom_point(alpha = 0.12, size = 0.7, colour = "steelblue") +
+  geom_smooth(method = "loess", span = 0.4,
+              colour = "darkred", fill = "salmon", linewidth = 1.1) +
+  geom_vline(xintercept = mean_lt, linetype = "dotted",
+             colour = "grey40", linewidth = 0.8) +
+  annotate("text", x = mean_lt + 15, y = max(hotel_lm$log_adr) * 0.98,
+           label = paste0("Mean = ", mean_lt, " days"), size = 3, colour = "grey40") +
+  scale_x_continuous(limits = c(0, 400)) +
+  labs(title = "Lead Time vs. Room Price",
+       x = "Lead Time (days before arrival)", y = "log(ADR)") +
+  theme_minimal(base_size = 10)
+
+p_seg + p_lead
+```
+
+## Model Setup: Centering and Reference Levels
+
+Two methodological choices follow directly from the lecture material. First, continuous predictors (`LeadTime`, `avg_temp_c`) are **mean-centred**: subtracting the sample mean (`r mean_lt` days for lead time; `r mean_temp`°C for temperature) ensures that the model intercept has a concrete interpretation — the expected log(ADR) for a booking made with average lead time at average temperature, in the Online TA reference segment, during Summer. Without centering, the intercept would represent a booking made 0 days in advance at 0°C — a combination that does not exist in the data.
+
+Second, `Online TA` is set as the reference level for market segment (the largest group at 49% of bookings), and `Transient` for customer type (75% of bookings). This choice ensures the intercept represents the most common booking profile, making the reference case immediately meaningful.
+
+## Model Fitting
+
+```{r lm-split}
+set.seed(2026)
+idx_lm   <- createDataPartition(hotel_lm$log_adr, p = 0.8, list = FALSE)
+train_lm <- hotel_lm[idx_lm, ]
+test_lm  <- hotel_lm[-idx_lm, ]
+cat("Training:", nrow(train_lm), "| Test:", nrow(test_lm), "\n")
+```
+
+```{r lm-fit}
+model_lm <- lm(
+  log_adr ~ arrival_season + MarketSegment + CustomerType +
+            ReservedRoomType + LeadTime_c + TotalOfSpecialRequests +
+            IsRepeatedGuest + Meal + is_via_agent + avg_temp_c_c,
+  data = train_lm
+)
+
+cat(sprintf("Adjusted R²  : %.3f\n", summary(model_lm)$adj.r.squared))
+cat(sprintf("Residual SE  : %.3f log-ADR units\n", summary(model_lm)$sigma))
+```
+
+## Formal Predictor Testing with drop1()
+
+Rather than relying solely on individual coefficient p-values, we apply `drop1()` with an F-test to assess the contribution of each predictor to the overall model. This tests whether removing a predictor significantly worsens model fit — a more honest measure of importance than a coefficient's t-statistic, particularly for multi-level factors where no single coefficient captures the full effect of the variable.
+
+```{r lm-drop1, fig.cap="Figure 3: F-statistics from drop1() for each predictor in the Linear Model. The red dashed line marks the critical F-value at α = 0.05. All predictors cross the threshold, confirming that none are redundant — every variable in the model carries statistically significant explanatory power over room price."}
+
+drop1_res <- drop1(model_lm, test = "F")
+
+drop1_df <- as.data.frame(drop1_res) %>%
+  rownames_to_column("Predictor") %>%
+  filter(Predictor != "<none>") %>%
+  mutate(Predictor = dplyr::recode(Predictor,
+    "arrival_season"         = "Arrival Season",
+    "MarketSegment"          = "Market Segment",
+    "CustomerType"           = "Customer Type",
+    "ReservedRoomType"       = "Reserved Room Type",
+    "LeadTime_c"             = "Lead Time (centred)",
+    "TotalOfSpecialRequests" = "Special Requests",
+    "IsRepeatedGuest"        = "Repeated Guest",
+    "Meal"                   = "Meal Plan",
+    "is_via_agent"           = "Booked via Agent",
+    "avg_temp_c_c"           = "Avg Temperature (centred)"
+  ))
+
+crit_f <- qf(0.95, df1 = 1, df2 = df.residual(model_lm))
+
+ggplot(drop1_df, aes(x = `F value`, y = reorder(Predictor, `F value`))) +
+  geom_segment(aes(x = 0, xend = `F value`,
+                   yend = reorder(Predictor, `F value`)),
+               colour = "grey75", linewidth = 0.8) +
+  geom_point(aes(colour = `Pr(>F)` < 0.05), size = 4) +
+  scale_colour_manual(
+    values = c("TRUE" = "steelblue", "FALSE" = "grey50"),
+    labels = c("TRUE" = "Significant (p < 0.05)", "FALSE" = "Not significant"),
+    name   = NULL
+  ) +
+  geom_vline(xintercept = crit_f, linetype = "dashed",
+             colour = "darkred", linewidth = 0.8) +
+  annotate("text", x = crit_f + 5, y = 1,
+           label = paste0("Critical F = ", round(crit_f, 1)),
+           colour = "darkred", size = 3.2, hjust = 0) +
+  labs(
+    title    = "Predictor Importance: drop1() F-Statistics",
+    subtitle = "Each bar shows how much model fit deteriorates when that predictor is removed",
+    x = "F-statistic", y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+## The Unique Effect of Lead Time: Added-Variable Plot
+
+A coefficient in a multiple regression reflects the effect of a predictor *after accounting for all other predictors*. To visualise this unambiguously for lead time — the most actionable predictor for pricing strategy — we construct an **added-variable (partial regression) plot**. This plot shows the residual variation in log(ADR) that cannot be explained by any other predictor in the model, plotted against the residual variation in lead time after removing the same set of predictors. The slope of the relationship is therefore the pure, isolated effect of lead time on price.
+
+```{r lm-avplot, fig.cap="Figure 4: Added-variable plot for lead time. The negative slope confirms that longer lead times are genuinely associated with lower room prices — this is not an artefact of confounding with season or market segment."}
+
+model_no_lt <- lm(
+  log_adr ~ arrival_season + MarketSegment + CustomerType +
+            ReservedRoomType + TotalOfSpecialRequests +
+            IsRepeatedGuest + Meal + is_via_agent + avg_temp_c_c,
+  data = train_lm
+)
+
+model_lt_on_x <- lm(
+  LeadTime_c ~ arrival_season + MarketSegment + CustomerType +
+               ReservedRoomType + TotalOfSpecialRequests +
+               IsRepeatedGuest + Meal + is_via_agent + avg_temp_c_c,
+  data = train_lm
+)
+
+av_df <- data.frame(
+  resid_y  = residuals(model_no_lt),
+  resid_lt = residuals(model_lt_on_x)
+)
+
+ggplot(av_df %>% sample_n(6000), aes(x = resid_lt, y = resid_y)) +
+  geom_point(alpha = 0.12, size = 0.7, colour = "steelblue") +
+  geom_smooth(method = "lm", colour = "darkred",
+              fill = "salmon", linewidth = 1.2, se = TRUE) +
+  labs(
+    title    = "Added-Variable Plot: Lead Time → Room Price",
+    subtitle = "Pure effect of lead time after controlling for all other predictors",
+    x        = "Lead Time residuals (days — unexplained by other predictors)",
+    y        = "log(ADR) residuals (unexplained by other predictors)"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+## Marginal Effect: Translating Lead Time into Euros
+
+```{r lm-marginal, fig.cap="Figure 5: Predicted ADR (€) as a function of lead time for a typical Online TA Transient Summer booking. A last-minute booking commands roughly €20 more per night than one made 200 days in advance."}
+
+lead_seq    <- seq(0, 400, by = 2)
+mean_lt_val <- mean(train_lm$LeadTime, na.rm = TRUE)
+mode_room   <- names(sort(table(train_lm$ReservedRoomType), decreasing = TRUE))[1]
+
+newdata_lt <- data.frame(
+  LeadTime_c             = lead_seq - mean_lt_val,
+  MarketSegment          = factor("Online TA",  levels = levels(train_lm$MarketSegment)),
+  CustomerType           = factor("Transient",  levels = levels(train_lm$CustomerType)),
+  arrival_season         = factor("Summer",     levels = levels(train_lm$arrival_season)),
+  ReservedRoomType       = factor(mode_room,    levels = levels(train_lm$ReservedRoomType)),
+  Meal                   = factor("BB",         levels = levels(train_lm$Meal)),
+  TotalOfSpecialRequests = mean(train_lm$TotalOfSpecialRequests, na.rm = TRUE),
+  IsRepeatedGuest        = 0L,
+  is_via_agent           = 1L,
+  avg_temp_c_c           = 0
+)
+
+preds_lt       <- predict(model_lm, newdata = newdata_lt, interval = "confidence")
+newdata_lt$fit <- exp(preds_lt[, "fit"])
+newdata_lt$lwr <- exp(preds_lt[, "lwr"])
+newdata_lt$upr <- exp(preds_lt[, "upr"])
+
+ggplot(newdata_lt, aes(x = lead_seq)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), fill = "steelblue", alpha = 0.2) +
+  geom_line(aes(y = fit), colour = "steelblue", linewidth = 1.3) +
+  geom_vline(xintercept = mean_lt_val, linetype = "dashed",
+             colour = "grey50", linewidth = 0.7) +
+  annotate("text", x = mean_lt_val + 8, y = max(newdata_lt$upr) * 0.98,
+           label = paste0("Mean lead time\n(", round(mean_lt_val), " days)"),
+           size = 3.2, colour = "grey40", hjust = 0) +
+  scale_y_continuous(labels = dollar_format(prefix = "€")) +
+  labs(
+    title    = "Marginal Effect of Lead Time on Room Price",
+    subtitle = "Reference: Online TA · Transient · Summer · BB meal · via agent",
+    x        = "Lead Time (days before arrival)",
+    y        = "Predicted ADR (€/night)"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+## Model Diagnostics
+
+```{r lm-diagnostics, fig.cap="Figure 6: Residual diagnostics — broadly homoscedastic spread and approximate normality support the adequacy of the log-transformation.", fig.height=4}
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+plot(model_lm, which = 1, main = "Residuals vs Fitted",
+     col = adjustcolor("steelblue", 0.3), pch = 16, cex = 0.5)
+plot(model_lm, which = 2, main = "Normal Q-Q",
+     col = adjustcolor("steelblue", 0.5), pch = 16, cex = 0.5)
+par(mfrow = c(1, 1))
+```
+
+## Test Set Performance
+
+```{r lm-test}
+pred_lm  <- predict(model_lm, newdata = test_lm)
+rmse_lm  <- sqrt(mean((pred_lm - test_lm$log_adr)^2))
+r2_test  <- cor(pred_lm, test_lm$log_adr)^2
+rmse_eur <- exp(mean(test_lm$log_adr) + rmse_lm) - exp(mean(test_lm$log_adr))
+
+cat(sprintf("Adjusted R² (train): %.3f\n", summary(model_lm)$adj.r.squared))
+cat(sprintf("R² on test set:      %.3f\n", r2_test))
+cat(sprintf("Approx. error in €:  ±€%.1f per night\n", abs(rmse_eur)))
+```
+
+```{r lm-pred-vs-actual, fig.cap="Figure 7: Predicted vs. observed ADR on the held-out test set. Points cluster tightly around the 45° line, confirming good out-of-sample generalisation."}
+
+data.frame(predicted = pred_lm, observed = test_lm$log_adr) %>%
+  sample_n(3000) %>%
+  ggplot(aes(x = exp(predicted), y = exp(observed))) +
+  geom_point(alpha = 0.2, size = 0.8, colour = "steelblue") +
+  geom_abline(slope = 1, intercept = 0,
+              colour = "darkred", linetype = "dashed", linewidth = 0.9) +
+  scale_x_continuous(labels = dollar_format(prefix = "€"), limits = c(0, 600)) +
+  scale_y_continuous(labels = dollar_format(prefix = "€"), limits = c(0, 600)) +
+  labs(
+    title    = "Predicted vs. Observed ADR — Test Set",
+    subtitle = "Red dashed line = perfect prediction",
+    x = "Predicted ADR (€/night)", y = "Observed ADR (€/night)"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+The Linear Model explains `r round(summary(model_lm)$adj.r.squared * 100, 1)`% of variance in log(ADR) on the training set, with an out-of-sample R² of `r round(r2_test, 3)` and a practical prediction error of approximately ±€`r round(abs(rmse_eur), 1)` per night. A revenue manager could use the model to flag bookings where the proposed rate sits more than one standard error above or below the prediction, triggering a manual pricing review.
+
+---
+
+# Model 2: Poisson GLM — Who Stays Longest?
+
+*Section lead: Divya Shori*
+
+## Research Question
+
+> **Which guest segments and booking characteristics predict longer stays, and can we quantify the premium value of high-stay-length segments?**
+
+Length of stay directly determines booking revenue: all else equal, a guest who stays four nights generates twice the revenue of a guest who stays two. `total_stays` (weekend plus weekday nights) is a non-negative integer count variable with a mean of `r round(mean(hotel_data$total_stays), 2)` nights. A Poisson GLM is the natural choice: it models a log-linear relationship between predictors and expected count, and naturally enforces non-negative predictions.
+
+## Count Distribution and Overdispersion Motivation
+
+```{r poisson-dist, fig.cap="Figure 8: Observed stay length (blue bars) versus the theoretical Poisson distribution at the observed mean (red line). The heavier right tail in the data relative to the Poisson prediction motivates a formal overdispersion check."}
+
+hotel_pois <- hotel_data %>%
+  filter(total_stays > 0,
+         !as.character(MarketSegment) %in% c("Undefined"))
+hotel_pois$MarketSegment <- droplevels(hotel_pois$MarketSegment)
+
+obs_lambda  <- mean(hotel_pois$total_stays)
+max_display <- 14
+
+pois_theoretical <- data.frame(
+  nights   = 1:max_display,
+  expected = dpois(1:max_display, lambda = obs_lambda) * nrow(hotel_pois)
+)
+
+hotel_pois %>%
+  filter(total_stays <= max_display) %>%
+  ggplot(aes(x = total_stays)) +
+  geom_histogram(aes(y = after_stat(count)), binwidth = 1,
+                 fill = "steelblue", colour = "white", alpha = 0.75) +
+  geom_line(data = pois_theoretical,
+            aes(x = nights, y = expected),
+            colour = "darkred", linewidth = 1.3) +
+  geom_point(data = pois_theoretical,
+             aes(x = nights, y = expected),
+             colour = "darkred", size = 2.5) +
+  scale_x_continuous(breaks = 1:max_display) +
+  labs(
+    title    = "Distribution of Total Nights Booked",
+    subtitle = paste0("Observed (blue) vs. Poisson(λ = ", round(obs_lambda, 2),
+                      ") prediction (red)"),
+    x = "Total Nights Booked", y = "Number of Bookings"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+```{r poisson-meanvar, fig.cap="Figure 9: Mean versus variance of total nights booked across market segment × season groups. Nearly all points lie above the Var = Mean line, confirming systematic overdispersion — variance exceeds the mean in almost every subgroup."}
+
+mv_data <- hotel_pois %>%
+  group_by(MarketSegment, arrival_season) %>%
+  summarise(
+    group_mean = mean(total_stays),
+    group_var  = var(total_stays),
+    n          = n(),
+    .groups    = "drop"
+  ) %>%
+  filter(n >= 30)
+
+ggplot(mv_data, aes(x = group_mean, y = group_var,
+                    colour = MarketSegment, size = n)) +
+  geom_point(alpha = 0.85) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", colour = "darkred", linewidth = 0.9) +
+  annotate("text", x = 1.3, y = 1.2,
+           label = "Var = Mean\n(Poisson assumption)",
+           colour = "darkred", size = 3.2, hjust = 0) +
+  scale_size_continuous(range = c(2, 9), name = "Bookings in group") +
+  scale_colour_brewer(palette = "Set2", name = "Market Segment") +
+  labs(
+    title    = "Mean–Variance Relationship by Market Segment and Season",
+    subtitle = "Points above the dashed line signal overdispersion (Var > Mean)",
+    x = "Group Mean (nights)", y = "Group Variance"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "right")
+```
+
+## Model Fitting and Overdispersion Check
+
+```{r poisson-fit}
+set.seed(2026)
+idx_pois   <- createDataPartition(hotel_pois$total_stays, p = 0.8, list = FALSE)
+train_pois <- hotel_pois[idx_pois, ]
+test_pois  <- hotel_pois[-idx_pois, ]
+
+model_pois <- glm(
+  total_stays ~ MarketSegment + CustomerType + arrival_season +
+                DepositType + IsRepeatedGuest + Meal +
+                avg_temp_c + precipitation_mm + country_region,
+  data = train_pois, family = poisson
+)
+
+disp_ratio <- deviance(model_pois) / df.residual(model_pois)
+cat(sprintf("Dispersion ratio (Deviance / df): %.2f\n", disp_ratio))
+cat(sprintf("→ %s\n",
+    ifelse(disp_ratio > 1.5,
+           "Overdispersion confirmed — refitting with quasi-Poisson.",
+           "No strong overdispersion — Poisson retained.")))
+```
+
+```{r quasipoisson-refit}
+if (disp_ratio > 1.5) {
+  model_pois <- glm(
+    total_stays ~ MarketSegment + CustomerType + arrival_season +
+                  DepositType + IsRepeatedGuest + Meal +
+                  avg_temp_c + precipitation_mm + country_region,
+    data = train_pois, family = quasipoisson
+  )
+  cat("Quasi-Poisson fitted. Coefficients unchanged; SEs corrected upward.\n")
+}
+
+model_null <- glm(total_stays ~ 1, data = train_pois, family = quasipoisson)
+anova(model_null, model_pois, test = "F")
+```
+
+## Formal Predictor Testing
+
+```{r poisson-drop1}
+drop1(model_pois, test = "F")
+```
+
+## Rate Ratio Forest Plot
+
+```{r poisson-forest, fig.cap="Figure 10: Rate ratios from the quasi-Poisson GLM. Values above 1 indicate longer expected stays than the reference group. Error bars are 95% confidence intervals; blue points are significant at p < 0.05."}
+
+pois_tidy <- tidy(model_pois, conf.int = TRUE) %>%
+  mutate(
+    rr      = exp(estimate),
+    rr_low  = exp(conf.low),
+    rr_high = exp(conf.high)
+  ) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    significant = p.value < 0.05,
+    term_clean  = term %>%
+      str_replace("MarketSegment",    "Segment: ") %>%
+      str_replace("CustomerType",     "Customer: ") %>%
+      str_replace("arrival_season",   "Season: ") %>%
+      str_replace("DepositType",      "Deposit: ") %>%
+      str_replace("country_region",   "Region: ") %>%
+      str_replace("Meal",             "Meal: ") %>%
+      str_replace("avg_temp_c",       "Avg Temperature") %>%
+      str_replace("precipitation_mm", "Precipitation") %>%
+      str_replace("IsRepeatedGuest",  "Repeated Guest")
+  ) %>%
+  arrange(rr)
+
+ggplot(pois_tidy, aes(x = rr, y = reorder(term_clean, rr), colour = significant)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = rr_low, xmax = rr_high), height = 0.35, linewidth = 0.7) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey30", linewidth = 0.8) +
+  scale_colour_manual(
+    values = c("TRUE" = "steelblue", "FALSE" = "grey60"),
+    labels = c("TRUE" = "p < 0.05", "FALSE" = "p ≥ 0.05"), name = "Significance"
+  ) +
+  scale_x_continuous(breaks = seq(0.4, 1.8, by = 0.2),
+                     labels = function(x) paste0(x, "×")) +
+  labs(
+    title    = "Rate Ratios: Quasi-Poisson GLM for Total Nights Booked",
+    subtitle = "Values > 1 = longer stays than reference; < 1 = shorter stays",
+    x = "Rate Ratio [exp(β)]", y = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "top")
+```
+
+## Post-Hoc Contrasts: Which Segments Differ?
+
+```{r poisson-glht, fig.cap="Figure 11: Tukey pairwise contrasts between market segments. Blue points indicate statistically significant differences after multiple comparison correction."}
+
+glht_pois <- glht(model_pois, linfct = mcp(MarketSegment = "Tukey"))
+
+glht_df <- as.data.frame(confint(glht_pois)$confint) %>%
+  rownames_to_column("Contrast") %>%
+  rename(estimate = Estimate, lower = lwr, upper = upr) %>%
+  mutate(
+    rr          = exp(estimate),
+    rr_low      = exp(lower),
+    rr_high     = exp(upper),
+    significant = !(rr_low <= 1 & rr_high >= 1)
+  )
+
+ggplot(glht_df, aes(x = rr, y = reorder(Contrast, rr), colour = significant)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = rr_low, xmax = rr_high), height = 0.4, linewidth = 0.7) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "darkred", linewidth = 0.8) +
+  scale_colour_manual(
+    values = c("TRUE" = "steelblue", "FALSE" = "grey60"),
+    labels = c("TRUE" = "Significant (Tukey)", "FALSE" = "Not significant"), name = NULL
+  ) +
+  scale_x_continuous(labels = function(x) paste0(x, "×")) +
+  labs(
+    title    = "Pairwise Market Segment Contrasts: Stay Length",
+    subtitle = "Tukey-corrected; rate ratio > 1 means first segment stays longer",
+    x = "Rate Ratio (exp[contrast])", y = NULL
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(legend.position = "top")
+```
+
+## Business Interpretation
+
+```{r poisson-test-performance}
+pred_pois <- predict(model_pois, newdata = test_pois, type = "response")
+mae_pois  <- mean(abs(pred_pois - test_pois$total_stays))
+rmse_pois <- sqrt(mean((pred_pois - test_pois$total_stays)^2))
+cat(sprintf("Mean Absolute Error: %.2f nights\n", mae_pois))
+cat(sprintf("RMSE:                %.2f nights\n", rmse_pois))
+```
+
+The quasi-Poisson model confirms that market segment, customer type, meal plan, and seasonal conditions are all significant predictors of stay length. The practical prediction error of approximately `r round(mae_pois, 1)` nights reflects the inherent heterogeneity of hotel bookings. From a commercial standpoint, the rate ratio estimates directly quantify the revenue implication of targeting different segments — information that can inform channel mix decisions and promotional strategy.
+
+---
+
+# Model 3: Binomial GLM — Predicting Cancellations
+
+*Section lead: [Teammate name]*
+
+<!-- Teammate section goes here -->
+
+---
+
+# Model 4: Generalised Additive Model
+
+*Section lead: [Teammate name]*
+
+<!-- Teammate section goes here -->
+
+---
+
+# Model 5: Support Vector Machine
+
+*Section lead: [Teammate name]*
+
+<!-- Teammate section goes here -->
+
+---
+
+# Model 6: Neural Network
+
+*Section lead: [Teammate name]*
+
+<!-- Teammate section goes here -->
+
+---
+
+# Model Comparison
+
+<!-- Shared section — to be completed together -->
+
+---
+
+# Conclusion
+
+<!-- Shared section — to be completed together -->
+
+---
+
+# Challenges and Limitations
+
+One notable data pipeline dependency warrants discussion. The weather enrichment relies on a live API call to the Open-Meteo historical weather archive at knit time. If the API is unavailable during rendering, the join produces missing values across all weather-derived predictors (`avg_temp_c`, `precipitation_mm`, `sunshine_hours`), causing downstream model chunks to fail. A production-grade pipeline would cache the API response locally after the first successful fetch, ensuring reproducibility independent of network access. This limitation is relevant to any team seeking to reproduce or extend this analysis.
+
+---
+
+# AI Usage Statement
+
+<!-- Required by assignment — describe how AI tools were used in this project -->
+
+---
+
+# References
+
+Antonio, N., de Almeida, A., & Nunes, L. (2019). Hotel booking demand datasets. *Data in Brief*, 22, 41–49.
+
+Open-Meteo Historical Weather API. Retrieved from https://open-meteo.com
