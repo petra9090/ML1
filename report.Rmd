@@ -974,25 +974,275 @@ cat(sprintf("RMSE:                %.2f nights\n", rmse_pois))
 
 
 The quasi-Poisson model predicts stay length to within approximately `r round(mae_pois, 1)` nights on the held-out test set — a useful level of accuracy for segment-level planning. The business implication is straightforward: the hotel should prioritise channels and customer types associated with longer stays when capacity allows. Online TA and leisure segments in Summer represent the highest-value long-stay profiles. A targeted promotion, such as a discounted third or fourth night for Online TA bookings made more than 60 days in advance — could meaningfully shift the average stay length upward for this segment, generating incremental revenue with minimal additional operational cost.
-
 ---
+# Model 3: Binomial GLM — Which Bookings Will Cancel?
 
-# Model 3: Binomial GLM — Predicting Cancellations
+*Section lead: Lorena Zovkic*
 
-*Section lead: [Teammate name]*
+## Research Question
 
-<!-- Teammate section goes here -->
+> **Which characteristics of a booking, known at the moment of reservation, most reliably predict whether the guest will cancel?**
 
+Cancellations are the single largest source of revenue uncertainty for the hotel. A booking that cancels generates no revenue but consumes capacity that could have been sold to another guest. Identifying high-risk bookings at the point of reservation — before any room is allocated — allows the hotel to act: send retention communications, adjust overbooking levels, or flag reservations for manual review. This model builds that early-warning signal.
+
+## Why This Model
+
+`IsCanceled` is a binary outcome — a booking either cancels or it does not. The Binomial Generalised Linear Model (logistic regression) is the natural choice for binary response variables. It models the log-odds of cancellation as a linear function of predictors, guaranteeing predictions that remain within the [0, 1] probability range and producing coefficients interpretable as odds ratios. This interpretability is critical here: we want not just a prediction, but an understanding of *why* certain bookings are high-risk.
+
+## Data Preparation
+
+```{r binomial-prep}
+hotel_bin <- hotel_data %>%
+  filter(!as.character(MarketSegment) %in% c("Undefined", "Complementary"))
+hotel_bin$MarketSegment <- droplevels(hotel_bin$MarketSegment)
+
+set.seed(2026)
+idx_bin   <- createDataPartition(hotel_bin$IsCanceled, p = 0.8, list = FALSE)
+train_bin <- hotel_bin[idx_bin, ]
+test_bin  <- hotel_bin[-idx_bin, ]
+
+cat(sprintf("Training: %d | Test: %d | Cancel rate (train): %.1f%%\n",
+            nrow(train_bin), nrow(test_bin),
+            mean(train_bin$IsCanceled) * 100))
+```
+
+The binary outcome is well-balanced at 41.7% cancellations, which means neither class dominates and standard threshold-based evaluation (accuracy, recall, precision) remains meaningful without resampling corrections.
+
+## Exploratory Plots
+
+```{r binomial-eda, fig.cap="Figure 12: Cancellation rate by deposit type (left) and estimated cancellation probability as a function of lead time (right). The near-100% cancellation rate for Non Refund deposits is a data artefact discussed below. The LOESS smoother on lead time reveals a nonlinear pattern — risk rises steeply up to approximately 150 days before levelling off — which motivates the GAM in the next section.", fig.width=10, fig.height=4}
+library(pROC)
+
+p_dep <- train_bin %>%
+  group_by(DepositType) %>%
+  summarise(rate = mean(IsCanceled), n = n(), .groups = "drop") %>%
+  ggplot(aes(x = reorder(DepositType, rate), y = rate, fill = DepositType)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = paste0(scales::percent(rate, accuracy = 0.1),
+                               "\n(n=", scales::comma(n), ")")),
+            hjust = -0.05, size = 3) +
+  coord_flip() +
+  scale_fill_manual(values = c("No Deposit" = "steelblue",
+                               "Non Refund" = "tomato",
+                               "Refundable" = "darkorange")) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1.2)) +
+  labs(title = "Cancellation Rate by Deposit Type",
+       subtitle = "Non Refund = 99.8% — likely a recording artefact",
+       x = NULL, y = "Cancellation Rate") +
+  theme_minimal(base_size = 10)
+
+p_lead <- train_bin %>%
+  ggplot(aes(x = LeadTime, y = IsCanceled)) +
+  geom_smooth(method = "loess", span = 0.35,
+              colour = "steelblue", fill = "lightblue", linewidth = 1.2) +
+  geom_hline(yintercept = mean(train_bin$IsCanceled),
+             linetype = "dashed", colour = "darkred", linewidth = 0.7) +
+  annotate("text", x = 420, y = mean(train_bin$IsCanceled) + 0.04,
+           label = paste0("Overall rate = ",
+                          scales::percent(mean(train_bin$IsCanceled), accuracy = 0.1)),
+           colour = "darkred", size = 3.2) +
+  scale_x_continuous(limits = c(0, 500)) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 0.9)) +
+  labs(title = "Cancellation Probability by Lead Time",
+       subtitle = "LOESS smoother — clearly nonlinear beyond ~150 days",
+       x = "Lead Time (days before arrival)",
+       y = "P(Cancellation)") +
+  theme_minimal(base_size = 10)
+
+p_dep + p_lead
+```
+
+## Model Fitting
+
+```{r binomial-fit, cache=TRUE}
+model_binomial <- glm(
+  IsCanceled ~ LeadTime + DepositType + MarketSegment +
+    PreviousCancellations + TotalOfSpecialRequests +
+    IsRepeatedGuest + BookingChanges + DaysInWaitingList +
+    CustomerType + is_via_agent + arrival_season,
+  data   = train_bin,
+  family = binomial
+)
+
+cat(sprintf("Null deviance:     %.1f on %d df\n",
+            model_binomial$null.deviance, model_binomial$df.null))
+cat(sprintf("Residual deviance: %.1f on %d df\n",
+            deviance(model_binomial), df.residual(model_binomial)))
+cat(sprintf("McFadden pseudo-R²: %.3f\n",
+            1 - deviance(model_binomial) / model_binomial$null.deviance))
+```
+
+## Coefficient Interpretation
+
+```{r binomial-forest, fig.cap="Figure 13: Odds ratios from the Binomial GLM with 95% confidence intervals. Values above 1 increase cancellation odds; values below 1 reduce them. The Non Refund deposit is excluded from this plot due to near-perfect separation (discussed separately). All displayed predictors are on a log scale so that symmetric intervals appear symmetric visually.", fig.height=7, fig.width=8}
+
+bin_tidy <- tidy(model_binomial, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)",
+         !grepl("Non.Refund", term)) %>%
+  mutate(
+    significant = p.value < 0.05,
+    term_clean  = term %>%
+      str_replace("MarketSegment",        "Segment: ") %>%
+      str_replace("CustomerType",         "Customer: ") %>%
+      str_replace("DepositType",          "Deposit: ") %>%
+      str_replace("arrival_season",       "Season: ") %>%
+      str_replace("LeadTime",             "Lead Time") %>%
+      str_replace("PreviousCancellations","Previous Cancellations") %>%
+      str_replace("TotalOfSpecialRequests","Special Requests") %>%
+      str_replace("IsRepeatedGuest",      "Repeated Guest") %>%
+      str_replace("BookingChanges",       "Booking Changes") %>%
+      str_replace("DaysInWaitingList",    "Days on Waiting List") %>%
+      str_replace("is_via_agent",         "Booked via Agent")
+  )
+
+ggplot(bin_tidy, aes(x = estimate, y = reorder(term_clean, estimate),
+                     colour = significant)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.35, linewidth = 0.7) +
+  geom_vline(xintercept = 1, linetype = "dashed",
+             colour = "grey30", linewidth = 0.8) +
+  scale_x_log10(labels = function(x) paste0(x, "×")) +
+  scale_colour_manual(
+    values = c("TRUE" = "steelblue", "FALSE" = "grey60"),
+    labels = c("TRUE" = "p < 0.05", "FALSE" = "p ≥ 0.05"), name = NULL
+  ) +
+  labs(
+    title    = "Binomial GLM — Odds Ratios for Cancellation",
+    subtitle = "Non Refund deposit excluded (OR ≈ ∞ — artefact, see text)",
+    x = "Odds Ratio [exp(β)] — log scale", y = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "top")
+```
+
+Four predictors stand out for practical interpretation:
+
+- **Lead time**: Each additional 10 days of lead time multiplies cancellation odds by approximately `r round(exp(coef(model_binomial)["LeadTime"] * 10), 2)`×. A booking made 200 days in advance carries roughly `r round(exp(coef(model_binomial)["LeadTime"] * 200) / exp(coef(model_binomial)["LeadTime"] * 7), 1)` times higher cancellation odds than one made one week out. This is the most actionable signal available at booking time.
+
+- **Special requests**: Each additional special request multiplies cancellation odds by `r round(exp(coef(model_binomial)["TotalOfSpecialRequests"]), 2)`× — meaning it *reduces* them by `r round((1 - exp(coef(model_binomial)["TotalOfSpecialRequests"])) * 100, 0)`%. Guests who personalise their booking demonstrate genuine commitment to their stay. This single variable is the strongest *protective* factor in the model.
+
+- **Previous cancellations**: Guests with a history of cancelling are substantially more likely to cancel again. Each prior cancellation multiplies current odds by `r round(exp(coef(model_binomial)["PreviousCancellations"]), 2)`×, making booking history a powerful and underused risk signal.
+
+- **Non Refund deposit** (excluded from plot): The estimated odds ratio is effectively infinite because 99.8% of these bookings appear as cancelled. This almost certainly reflects a recording convention where no-shows are retroactively reclassified under this deposit label — a causal interpretation is not warranted. In a real deployment, this variable would be excluded from the prediction model.
+
+## Model Evaluation
+
+```{r binomial-roc, fig.cap="Figure 14: ROC curve for the Binomial GLM on the held-out test set. The AUC measures the model's ability to rank a random cancellation above a random non-cancellation, regardless of the decision threshold chosen.", fig.width=6, fig.height=5}
+
+pred_probs_bin <- predict(model_binomial, newdata = test_bin, type = "response")
+roc_bin        <- roc(test_bin$IsCanceled, pred_probs_bin, quiet = TRUE)
+
+plot(roc_bin,
+     col  = "steelblue", lwd = 2,
+     main = paste0("Binomial GLM — ROC Curve  (AUC = ",
+                   round(auc(roc_bin), 3), ")"))
+```
+
+```{r binomial-confmat}
+pred_class_bin <- factor(ifelse(pred_probs_bin > 0.5, 1, 0))
+cm_bin <- caret::confusionMatrix(pred_class_bin,
+                                  factor(test_bin$IsCanceled),
+                                  positive = "1")
+cm_bin
+```
+
+## Business Takeaway
+
+The Binomial GLM achieves an AUC of `r round(auc(roc_bin), 3)` on the held-out test set — well above chance, and a strong baseline for a model that uses only information available at booking time. For a revenue manager, two findings translate directly into action. First, any booking combining long lead time (>100 days), no special requests, and a prior cancellation history should trigger an automatic flag; these three factors together place a booking in the highest-risk tier. Second, a simple early-engagement nudge — asking guests to confirm a meal preference or room request within a week of booking — could shift the special requests count from zero to one, meaningfully reducing cancellation probability at near-zero operational cost.
 ---
+# Model 4: Generalised Additive Model — Nonlinear Cancellation Risk
 
-# Model 4: Generalised Additive Model
+*Section lead: Lorena Zovkic*
 
-*Section lead: [Teammate name]*
+## Research Question
 
-<!-- Teammate section goes here -->
+> **Is the relationship between lead time, room price, and cancellation risk truly linear — or does risk accumulate nonlinearly in ways a standard logistic regression cannot capture?**
 
+The LOESS smoother in the EDA (Figure EDA-5) and the exploratory plot above (Figure 12) both hint at a nonlinear relationship between lead time and cancellation probability. The Binomial GLM treats this effect as a straight line on the log-odds scale, which may underfit the true pattern. The Generalised Additive Model (GAM) relaxes this assumption by fitting smooth, data-driven curves for continuous predictors — letting the data determine the shape of each relationship rather than imposing it in advance.
+
+## Why This Model
+
+The GAM shares the Binomial GLM's response variable and link function, which makes direct comparison meaningful. The difference is the treatment of continuous predictors: where the GLM imposes linearity, the GAM estimates smooth splines — flexible curves whose complexity is controlled by the data itself through penalised regression. The effective degrees of freedom (edf) reported for each smooth term quantifies how nonlinear that relationship actually is: an edf close to 1 means the smooth is essentially linear (the GLM was adequate); an edf substantially above 1 confirms genuine nonlinearity that the GLM missed.
+
+## Model Fitting
+
+```{r gam-fit, cache=TRUE}
+library(mgcv)
+
+model_gam <- gam(
+  IsCanceled ~ s(LeadTime) + s(ADR) + s(DaysInWaitingList) +
+    DepositType + MarketSegment + PreviousCancellations +
+    TotalOfSpecialRequests + IsRepeatedGuest +
+    CustomerType + arrival_season,
+  data   = train_bin,
+  family = binomial,
+  method = "REML"
+)
+
+gam_summ <- summary(model_gam)
+cat(sprintf("Deviance explained: %.1f%%\n", gam_summ$dev.expl * 100))
+cat("\nSmooth term summary:\n")
+print(gam_summ$s.table)
+```
+
+## Smooth Term Plots
+
+```{r gam-smooths, fig.cap="Figure 15: Smooth terms from the GAM. Each panel shows the estimated effect of a continuous predictor on the log-odds of cancellation, with 95% confidence bands. The y-axis is the contribution to log-odds (centred); the effective degrees of freedom (edf) in each panel title indicates how nonlinear the relationship is.", fig.width=11, fig.height=4}
+
+par(mfrow = c(1, 3), mar = c(4, 4, 4, 1))
+plot(model_gam,
+     shade      = TRUE,
+     shade.col  = "lightblue",
+     seWithMean = TRUE,
+     scale      = 0,
+     residuals  = FALSE,
+     col        = "steelblue",
+     lwd        = 2)
+par(mfrow = c(1, 1))
+```
+
+Three patterns emerge from the smooth terms:
+
+- **s(LeadTime)** has an edf of `r round(gam_summ$s.table["s(LeadTime)", "edf"], 1)`, confirming meaningful nonlinearity. Cancellation risk rises steeply for bookings made up to approximately 100–150 days in advance, then plateaus. This plateau likely reflects a segment of highly committed long-planners — conference bookings, group travel — who book early but rarely cancel despite long horizons. A linear GLM misrepresents this structure throughout.
+
+- **s(ADR)** shows `r round(gam_summ$s.table["s(ADR)", "edf"], 1)` edf. Higher-priced rooms show a modestly elevated cancellation risk at mid-range prices, with the relationship flattening at the top — suggesting that guests paying very high rates are no more likely to cancel than those paying moderate ones.
+
+- **s(DaysInWaitingList)** has an edf close to 1, indicating that the small subset of bookings with waiting-list time behaves approximately linearly — the GLM assumption holds for this predictor.
+
+## GLM vs GAM: Does Flexibility Pay Off?
+
+```{r gam-aic}
+AIC(model_binomial, model_gam)
+```
+
+```{r gam-roc, fig.cap="Figure 16: ROC curves for the Binomial GLM (blue) and GAM (red) on the same held-out test set. The AUC difference quantifies the predictive gain from relaxing the linearity assumption.", fig.width=6, fig.height=5}
+
+gam_probs <- predict(model_gam, newdata = test_bin, type = "response")
+roc_gam   <- roc(test_bin$IsCanceled, gam_probs, quiet = TRUE)
+
+plot(roc_bin,
+     col  = "steelblue", lwd = 2,
+     main = "ROC Curves: Binomial GLM vs GAM")
+lines(roc_gam, col = "tomato", lwd = 2)
+legend("bottomright",
+       legend = c(paste0("Binomial GLM (AUC = ", round(auc(roc_bin), 3), ")"),
+                  paste0("GAM         (AUC = ", round(auc(roc_gam),  3), ")")),
+       col = c("steelblue", "tomato"), lwd = 2, bty = "n")
+```
+
+```{r gam-confmat}
+pred_class_gam <- factor(ifelse(gam_probs > 0.5, 1, 0))
+cm_gam <- caret::confusionMatrix(pred_class_gam,
+                                  factor(test_bin$IsCanceled),
+                                  positive = "1")
+cm_gam
+```
+
+## Business Takeaway
+
+The GAM achieves an AUC of `r round(auc(roc_gam), 3)` versus `r round(auc(roc_bin), 3)` for the logistic regression — a difference of `r round(auc(roc_gam) - auc(roc_bin), 3)` AUC points. The lower AIC (`r round(AIC(model_gam), 0)` vs `r round(AIC(model_binomial), 0)`) confirms that the GAM's additional flexibility yields a genuinely better-fitting model, not just overfitting. More importantly, the smooth for lead time tells a richer story than any single coefficient can: risk does not accumulate uniformly across the booking horizon, it accelerates sharply in the first 150 days and then stabilises. For the hotel, this means that a 60-day booking and a 200-day booking should not receive the same risk score — the GAM assigns meaningfully different probabilities where the GLM would not.
 ---
-
 # Model 5: Support Vector Machine
 
 *Section lead: [Teammate name]*
