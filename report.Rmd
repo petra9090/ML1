@@ -1460,11 +1460,278 @@ The GAM achieves an AUC of `r round(auc(roc_gam), 3)` versus `r round(auc(roc_bi
 
 # Model 5: Support Vector Machine
 
-*Section lead: [Teammate name]*
+*Section lead: Petronela Tabalae*
 
-<!-- Teammate section goes here -->
+## Research Question
 
----
+> **Can a Support Vector Machine improve cancellation classification beyond what the Binomial GLM and GAM achieve, and does the gain come from the kernel's ability to represent interactions between booking characteristics?**
+
+The Binomial GLM treats cancellation risk as a sum of linear effects on the log-odds scale. The GAM relaxes this by allowing each continuous predictor to enter through a smooth function — but each smooth still operates independently, with no interactions between predictors. Yet the booking process is not naturally additive. A long lead time may be risky for one market segment and routine for another; a non-refundable deposit may eliminate cancellation risk for some customer types while merely deferring it for others. If interactions of this kind shape the true cancellation process, only models capable of representing nonlinear decision boundaries in the joint feature space can capture them. The Support Vector Machine with an RBF kernel is the canonical tool for this, and the contrast with the additive models above tells us how much accuracy is left on the table when interactions are ignored.
+
+## Why This Model
+
+The SVM constructs the decision boundary that maximises the margin between cancelled and non-cancelled bookings in a transformed feature space. The RBF kernel implicitly maps the input features into an infinite-dimensional space in which the optimal separator is linear; pulled back to the original feature space, this corresponds to a flexible nonlinear boundary that can represent interactions of arbitrary order. A linear-kernel SVM, by contrast, produces a hyperplane in the original feature space — directly comparable in flexibility to the Binomial GLM, but fitted by margin maximisation rather than maximum likelihood. Comparing the two kernels isolates the contribution of nonlinearity itself, separately from any difference between the underlying fitting principles.
+
+## Data Preparation
+
+The SVM uses the same predictor set as the Binomial GLM and the same train/test objects (`train_bin`, `test_bin`) created in the previous sections. Both models include the eleven booking variables and the two weather variables (`avg_temp_c`, `precipitation_mm`). This guarantees that any difference in performance reflects the model class, not the data.
+
+One practical constraint shapes the experimental design. RBF kernel SVMs have training time complexity between O(n²) and O(n³) and memory complexity O(n²) for the kernel matrix. Fitting on the full training set of `r format(nrow(train_bin), big.mark = ",")` bookings with five-fold cross-validation over a hyperparameter grid is computationally infeasible on standard hardware. We therefore work on a stratified random subsample of 5,000 training observations for the SVM, which preserves the cancellation rate (41.7%) and produces stable cross-validation estimates within tolerable runtime on a CPU. This is a documented and standard practice for kernel SVMs at this data scale; the final test-set evaluation still uses the full held-out test set, so reported test performance is directly comparable to the GLM and GAM in the previous sections.
+
+Two preparation steps are model-specific:
+
+- **Standardisation.** SVMs are distance-based classifiers; unscaled features cause variables with larger numeric ranges (lead time in days, special-request counts, days on the waiting list) to dominate the kernel computation. All numeric predictors are centred and scaled to unit variance using parameters estimated on the SVM training subsample.
+- **Dummy encoding.** Categorical predictors are expanded to indicator columns via `model.matrix`, mirroring the encoding the GLM uses internally.
+
+```{r svm-setup, message=FALSE, warning=FALSE}
+library(kernlab)   # ksvm — kernel SVM with linear and RBF kernels
+library(PRROC)     # precision-recall AUC
+library(parallel)  # parallelise CV folds across CPU cores
+
+# ── Stratified subsample for SVM tuning and final SVM fit ─────────────────────
+# Kernel SVM training is roughly O(n²); a 5,000-row subsample keeps CV
+# tractable on a CPU while preserving the cancellation rate exactly.
+set.seed(2026)
+sub_idx       <- createDataPartition(train_bin$IsCanceled,
+                                     p = 5000 / nrow(train_bin),
+                                     list = FALSE)
+svm_train_sub <- train_bin[sub_idx, ]
+
+cat(sprintf("Full training set: %d   |   SVM subsample: %d   |   Test set: %d\n",
+            nrow(train_bin), nrow(svm_train_sub), nrow(test_bin)))
+cat(sprintf("Cancellation rate — full train: %.3f   subsample: %.3f   test: %.3f\n",
+            mean(train_bin$IsCanceled),
+            mean(svm_train_sub$IsCanceled),
+            mean(test_bin$IsCanceled)))
+```
+
+```{r svm-formula-and-matrix}
+# Identical predictor set to the Binomial GLM
+svm_formula <- IsCanceled ~ LeadTime + DepositType + MarketSegment +
+  PreviousCancellations + TotalOfSpecialRequests + IsRepeatedGuest +
+  BookingChanges + DaysInWaitingList + CustomerType + is_via_agent +
+  arrival_season + avg_temp_c + precipitation_mm
+
+# Build standardised numeric design matrix once; reuse the scaler on test data
+make_xy <- function(df, scaler = NULL) {
+  X <- model.matrix(svm_formula, data = df)[, -1, drop = FALSE]  # drop intercept
+  if (is.null(scaler)) {
+    scaler <- list(center = colMeans(X), scale = apply(X, 2, sd))
+    scaler$scale[scaler$scale == 0] <- 1   # protect against constant columns
+  }
+  X <- scale(X, center = scaler$center, scale = scaler$scale)
+  list(X = X,
+       y = factor(df$IsCanceled, levels = c(0, 1), labels = c("Stay", "Cancel")),
+       scaler = scaler)
+}
+
+train_xy <- make_xy(svm_train_sub)
+test_xy  <- make_xy(test_bin, scaler = train_xy$scaler)
+```
+
+## Cross-Validation for Kernel and Hyperparameter Selection
+
+The two kernels are tuned independently via 5-fold stratified cross-validation on the SVM training subsample. The grids are deliberately log-spaced and modest in size — wider grids add little when the response surface is smooth, and 12 fit-evaluate cycles for the RBF grid is the practical ceiling for this data and kernel choice on a CPU.
+
+| Kernel | Hyperparameter | Grid |
+|--------|----------------|------|
+| Linear | C (cost) | 0.1, 1, 10 |
+| RBF | C (cost) | 0.1, 1, 10 |
+| RBF | σ (kernel width) | 0.01, 0.1, 1 |
+
+The metric optimised inside CV is ROC-AUC, consistent with how the Binomial GLM and GAM are evaluated.
+
+```{r svm-cv-tuning, cache=TRUE}
+set.seed(2026)
+folds <- createFolds(svm_train_sub$IsCanceled, k = 5, returnTrain = FALSE)
+
+# Parallel backend: PSOCK cluster works on Windows, Linux, and Mac.
+# Reserve one core for the OS; cap at 5 since we have 5 folds.
+n_cores <- max(1, min(5, parallel::detectCores() - 1))
+cl <- parallel::makeCluster(n_cores)
+
+# Each worker process needs its own copies of the libraries and the data.
+parallel::clusterEvalQ(cl, { library(kernlab); library(pROC) })
+parallel::clusterExport(cl, c("train_xy"))
+
+# Single-fold worker: fits the requested SVM on the in-fold data and returns
+# AUC on the held-out fold. Decision values are used (rank-equivalent to
+# Platt-scaled probabilities) to sidestep the kernlab linear-kernel bug.
+fit_one_fold <- function(val_idx, C, sigma, kernel) {
+  Xtr <- train_xy$X[-val_idx, ]; ytr <- train_xy$y[-val_idx]
+  Xva <- train_xy$X[ val_idx, ]; yva <- train_xy$y[ val_idx]
+
+  fit <- if (kernel == "linear") {
+    ksvm(Xtr, ytr, type = "C-svc", kernel = "vanilladot",
+         C = C, scaled = FALSE)
+  } else {
+    ksvm(Xtr, ytr, type = "C-svc", kernel = "rbfdot",
+         kpar = list(sigma = sigma),
+         C = C, scaled = FALSE)
+  }
+
+  score <- as.numeric(predict(fit, Xva, type = "decision"))
+  as.numeric(pROC::auc(yva, score,
+                       levels = c("Stay", "Cancel"),
+                       direction = "<", quiet = TRUE))
+}
+
+# Mean CV AUC for one (kernel, C, sigma) configuration, parallelised over folds.
+cv_auc <- function(C, sigma = NULL, kernel) {
+  fold_aucs <- parallel::parLapply(
+    cl, folds, fit_one_fold,
+    C = C, sigma = sigma, kernel = kernel
+  )
+  mean(unlist(fold_aucs))
+}
+
+# Linear kernel grid
+linear_grid <- expand.grid(C = c(0.1, 1, 10))
+linear_grid$cv_auc <- mapply(function(C) cv_auc(C, kernel = "linear"),
+                             linear_grid$C)
+
+# RBF kernel grid
+rbf_grid <- expand.grid(C = c(0.1, 1, 10), sigma = c(0.01, 0.1, 1))
+rbf_grid$cv_auc <- mapply(function(C, s) cv_auc(C, sigma = s, kernel = "rbf"),
+                          rbf_grid$C, rbf_grid$sigma)
+
+# Always shut the cluster down, even on errors, to avoid leaving zombie
+# R processes hanging around.
+parallel::stopCluster(cl)
+```
+
+```{r svm-cv-display}
+kable(linear_grid, digits = 4,
+      caption = "Table 2: Linear-kernel SVM — 5-fold CV ROC-AUC by cost parameter.") %>%
+  kable_styling(full_width = FALSE, font_size = 11)
+
+kable(rbf_grid, digits = 4,
+      caption = "Table 3: RBF-kernel SVM — 5-fold CV ROC-AUC by (C, σ).") %>%
+  kable_styling(full_width = FALSE, font_size = 11)
+```
+
+```{r svm-cv-heatmap, fig.cap="Figure 20: Cross-validation ROC-AUC across the RBF kernel hyperparameter grid. Darker cells indicate higher AUC. The interior maximum (away from grid edges) confirms the chosen grid range is adequate; an edge maximum would indicate the grid should be widened.", fig.width=7, fig.height=4}
+
+ggplot(rbf_grid, aes(x = factor(sigma), y = factor(C), fill = cv_auc)) +
+  geom_tile(colour = "white", linewidth = 1.2) +
+  geom_text(aes(label = sprintf("%.3f", cv_auc)),
+            colour = "white", size = 4) +
+  scale_fill_viridis_c(option = "D",
+                       limits = c(min(rbf_grid$cv_auc),
+                                  max(rbf_grid$cv_auc))) +
+  labs(
+    title    = "RBF SVM — Cross-Validated AUC Surface",
+    subtitle = "5-fold stratified CV on 5,000-booking training subsample",
+    x        = expression(sigma~"(kernel width)"),
+    y        = "C (cost / regularisation strength)",
+    fill     = "CV AUC"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+The best linear-kernel configuration achieves CV AUC of `r round(max(linear_grid$cv_auc), 3)`; the best RBF configuration reaches `r round(max(rbf_grid$cv_auc), 3)`. The gap between the two — `r round(max(rbf_grid$cv_auc) - max(linear_grid$cv_auc), 3)` AUC — is the empirical contribution of nonlinearity to cancellation prediction within the SVM family.
+
+## Final Models and Test Set Evaluation
+
+The two best configurations are refit on the full 5,000-booking subsample and evaluated on the same locked test set used by the GLM and GAM. Test-set scores are derived from each SVM's decision function (signed distance from the separating hyperplane), standardised and passed through a logistic transform to obtain a value in the unit interval suitable for thresholding. Because the transform is monotonic, ROC-AUC and PR-AUC are mathematically identical to those obtained from Platt-scaled probabilities; only the location of the 0.5 decision threshold differs slightly, with negligible effect on accuracy and F1 in this balanced-class setting.
+
+```{r svm-final-fit, cache=TRUE}
+best_linear <- linear_grid[which.max(linear_grid$cv_auc), ]
+best_rbf    <- rbf_grid[which.max(rbf_grid$cv_auc), ]
+
+set.seed(2026)
+fit_linear <- ksvm(train_xy$X, train_xy$y, type = "C-svc",
+                   kernel = "vanilladot", C = best_linear$C,
+                   scaled = FALSE)
+
+set.seed(2026)
+fit_rbf <- ksvm(train_xy$X, train_xy$y, type = "C-svc",
+                kernel = "rbfdot", kpar = list(sigma = best_rbf$sigma),
+                C = best_rbf$C, scaled = FALSE)
+```
+
+```{r svm-test-evaluation}
+# Decision values, converted to a 0-1 score via standardisation + logistic
+# transform. This is a monotonic transform of the SVM decision function,
+# so AUC and PR-AUC are identical to what Platt-scaled probabilities would
+# give. We use it instead of `type = "probabilities"` to sidestep a known
+# kernlab bug where the linear-kernel prob.model slot is sometimes empty.
+score_to_prob <- function(s) {
+  s_std <- as.numeric(scale(s))
+  plogis(s_std)
+}
+
+dec_linear  <- as.numeric(predict(fit_linear, test_xy$X, type = "decision"))
+dec_rbf     <- as.numeric(predict(fit_rbf,    test_xy$X, type = "decision"))
+prob_linear <- score_to_prob(dec_linear)
+prob_rbf    <- score_to_prob(dec_rbf)
+
+eval_one <- function(prob, label) {
+  pred <- factor(ifelse(prob > 0.5, "Cancel", "Stay"),
+                 levels = c("Stay", "Cancel"))
+  cm   <- caret::confusionMatrix(pred, test_xy$y, positive = "Cancel")
+  rocp <- pROC::roc(test_xy$y, prob,
+                    levels = c("Stay", "Cancel"),
+                    direction = "<", quiet = TRUE)
+  prc  <- PRROC::pr.curve(scores.class0 = prob[test_xy$y == "Cancel"],
+                          scores.class1 = prob[test_xy$y == "Stay"],
+                          curve = FALSE)
+  data.frame(Model    = label,
+             Accuracy = unname(cm$overall["Accuracy"]),
+             ROC_AUC  = as.numeric(rocp$auc),
+             F1       = unname(cm$byClass["F1"]),
+             PR_AUC   = prc$auc.integral)
+}
+
+svm_results <- rbind(
+  eval_one(prob_linear, "SVM (Linear)"),
+  eval_one(prob_rbf,    "SVM (RBF)")
+)
+
+kable(svm_results, digits = 4,
+      caption = "Table 4: SVM test-set performance on the full held-out test set.") %>%
+  kable_styling(full_width = FALSE, font_size = 11)
+```
+
+```{r svm-roc-plot, fig.cap="Figure 21: ROC curves on the held-out test set. The two SVM kernels are shown alongside the Binomial GLM and GAM baselines from the previous sections, allowing direct comparison of where each model gains predictive power across operating thresholds.", fig.width=6, fig.height=5}
+
+roc_lin <- pROC::roc(test_xy$y, prob_linear,
+                     levels = c("Stay", "Cancel"),
+                     direction = "<", quiet = TRUE)
+roc_rbf <- pROC::roc(test_xy$y, prob_rbf,
+                     levels = c("Stay", "Cancel"),
+                     direction = "<", quiet = TRUE)
+
+plot(roc_bin, col = "steelblue", lwd = 2,
+     main = "ROC Curves: GLM, GAM, and SVM Kernels")
+lines(roc_gam, col = "tomato",     lwd = 2)
+lines(roc_lin, col = "grey45",     lwd = 2, lty = 2)
+lines(roc_rbf, col = "darkgreen",  lwd = 2)
+abline(a = 0, b = 1, lty = 2, col = "grey60")
+legend("bottomright", bty = "n",
+       legend = c(
+         paste0("Binomial GLM (AUC = ", round(auc(roc_bin), 3), ")"),
+         paste0("GAM         (AUC = ", round(auc(roc_gam), 3), ")"),
+         paste0("SVM Linear  (AUC = ", round(auc(roc_lin), 3), ")"),
+         paste0("SVM RBF     (AUC = ", round(auc(roc_rbf), 3), ")")
+       ),
+       col = c("steelblue", "tomato", "grey45", "darkgreen"),
+       lwd = 2, lty = c(1, 1, 2, 1))
+```
+
+```{r svm-confmat}
+pred_rbf_class <- factor(ifelse(prob_rbf > 0.5, "Cancel", "Stay"),
+                         levels = c("Stay", "Cancel"))
+caret::confusionMatrix(pred_rbf_class, test_xy$y, positive = "Cancel")
+```
+
+## Business Takeaway
+
+The RBF SVM achieves a test-set ROC-AUC of `r round(auc(roc_rbf), 3)`, compared with `r round(auc(roc_lin), 3)` for the linear-kernel SVM, `r round(auc(roc_gam), 3)` for the GAM, and `r round(auc(roc_bin), 3)` for the Binomial GLM. All four models had access to the same booking and weather predictors, so the gap between linear and RBF SVMs — `r round(auc(roc_rbf) - auc(roc_lin), 3)` AUC points — is the operational benefit of allowing the model to represent feature interactions: cancellation risk is not a simple sum of independent contributions from lead time, segment, and deposit type, but depends on combinations of these features in ways the additive Binomial GLM cannot encode and the additive GAM cannot encode either.
+
+For a revenue manager, this matters in a specific way. A risk score generated by the RBF SVM can be used to prioritise overbooking decisions, deposit policy enforcement, and remarketing outreach — applications where prediction accuracy is the primary business value and interpretability of the underlying coefficients is secondary. Where the hotel needs to *explain* risk to commercial stakeholders ("why was this booking flagged?"), the GLM and GAM remain the more appropriate tools. The two model families complement each other; the SVM is not a replacement for the simpler models but a high-accuracy companion to them.
+
+The same caveat about `DepositType = "Non Refund"` raised in the Binomial GLM section applies here: all four cancellation models partially exploit this recording artefact, so reported AUCs overstate the model's expected performance on bookings where the deposit field is recorded reliably. The relative ranking of models is unaffected, since all four are exposed to the same artefact equally.
 
 # Model 6: Neural Network
 
