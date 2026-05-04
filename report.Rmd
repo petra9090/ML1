@@ -13,8 +13,10 @@ output:
     df_print: paged
 ---
 
-```{r libraries setup, include = FALSE}
+```{r libraries-setup, include = FALSE, cache = FALSE}
 # Load all libraries at the start
+# NOTE: this chunk is intentionally NOT cached — cached chunks would not
+# reload packages on subsequent renders, leading to "could not find function" errors.
 library(tidyverse)   # core data science packages
 library(readr)
 library(httr)
@@ -28,18 +30,44 @@ library(kableExtra)  # enhanced tables
 library(scales)      # axis formatting
 library(patchwork)   # combining plots
 library(caret)       # createDataPartition
+library(pROC)        # roc(), auc() — ROC curve analysis
 
-# Get the hotel data
+# Global chunk options:
+#   - cache = TRUE makes every chunk cache its results by default; subsequent
+#     renders skip unchanged chunks. Override with cache = FALSE on a per-chunk
+#     basis where needed (e.g. the libraries chunk above).
+#   - message/warning suppression keeps the rendered document clean and also
+#     reduces console I/O during rendering.
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 5,
+                      cache = TRUE)
+```
+
+```{r load-hotel-data, include = FALSE}
+# Cached: only re-runs if the code in this chunk changes.
+# If H2.csv itself changes, delete the report_cache/ folder to force a refresh.
 hotel_data <- read_csv(
   "H2.csv",
   na = c("NULL", "NA", ""),
   trim_ws = TRUE
 )
+```
 
-# Fetch weather data
-url <- "https://archive-api.open-meteo.com/v1/archive?latitude=38.72&longitude=-9.13&start_date=2015-01-01&end_date=2017-12-31&daily=temperature_2m_mean,precipitation_sum,sunshine_duration&timezone=Europe/Lisbon"
-response <- GET(url)
-weather_raw <- fromJSON(content(response, "text", encoding = "UTF-8"))
+```{r load-weather-data, include = FALSE}
+# Weather data is fetched once and cached locally as an .rds file. This avoids
+# hitting the open-meteo API on every render — the API call costs several
+# seconds of network latency and would also fail offline.
+weather_cache_path <- "weather_raw.rds"
+
+if (file.exists(weather_cache_path)) {
+  weather_raw <- readRDS(weather_cache_path)
+} else {
+  url <- "https://archive-api.open-meteo.com/v1/archive?latitude=38.72&longitude=-9.13&start_date=2015-01-01&end_date=2017-12-31&daily=temperature_2m_mean,precipitation_sum,sunshine_duration&timezone=Europe/Lisbon"
+  response    <- GET(url)
+  weather_raw <- fromJSON(content(response, "text", encoding = "UTF-8"))
+  saveRDS(weather_raw, weather_cache_path)
+}
+
 weather_daily <- as_tibble(weather_raw$daily) |>
   mutate(time = as.Date(time))
 
@@ -61,9 +89,6 @@ hotel_data <- hotel_data %>%
   left_join(weather_monthly,
             by = c("ArrivalDateYear" = "year",
                    "ArrivalDateMonth" = "month"))
-
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
-                      fig.align = "center", fig.width = 8, fig.height = 5)
 ```
 
 ```{r preprocessing, message=FALSE, warning=FALSE}
@@ -376,8 +401,13 @@ p_dep + p_zero_adr
 One relationship in the data stands out as particularly striking and has direct implications for how models are specified. The probability of cancellation is not a straight line — it rises sharply with lead time up to around 150 days, then begins to plateau. A guest who books 200 days in advance is far more likely to cancel than one who books a week out.
  
 ```{r eda-leadtime, fig.cap="Figure EDA-5: Estimated cancellation probability as a function of lead time, fitted with a LOESS smoother. The relationship is clearly nonlinear — risk rises steeply for bookings made more than 30 days in advance before levelling off. A straight line would substantially misrepresent this pattern."}
- 
+
+# Subsample for plotting only — LOESS on the full ~119k rows is slow
+# and the smoothed curve from a 10k random sample is visually identical.
+# The overall cancellation rate annotation still uses the full dataset.
+set.seed(2026)
 hotel_data %>%
+  slice_sample(n = 10000) %>%
   ggplot(aes(x = LeadTime, y = IsCanceled)) +
   geom_smooth(method = "loess", span = 0.35,
               colour = "steelblue", fill = "lightblue",
@@ -526,7 +556,7 @@ Second, `Online TA` is set as the reference level for market segment (the larges
 
 ## Model Fitting
 
-```{r lm-split}
+```{r lm-split, cache = TRUE}
 set.seed(2026)
 idx_lm   <- createDataPartition(hotel_lm$log_adr, p = 0.8, list = FALSE)
 train_lm <- hotel_lm[idx_lm, ]
@@ -534,7 +564,7 @@ test_lm  <- hotel_lm[-idx_lm, ]
 cat("Training:", nrow(train_lm), "| Test:", nrow(test_lm), "\n")
 ```
 
-```{r lm-fit}
+```{r lm-fit, cache = TRUE, dependson = "lm-split"}
 model_lm <- lm(
   log_adr ~ arrival_season + MarketSegment + CustomerType +
             ReservedRoomType + LeadTime_c + TotalOfSpecialRequests +
@@ -550,7 +580,7 @@ cat(sprintf("Residual SE  : %.3f log-ADR units\n", summary(model_lm)$sigma))
 
 Rather than relying solely on individual coefficient p-values, we apply `drop1()` with an F-test to assess the contribution of each predictor to the overall model. This tests whether removing a predictor significantly worsens model fit — a more honest measure of importance than a coefficient's t-statistic, particularly for multi-level factors where no single coefficient captures the full effect of the variable.
 
-```{r lm-drop1, fig.cap="Figure 3: F-statistics from drop1() for each predictor in the Linear Model. The red dashed line marks the critical F-value at α = 0.05. All predictors cross the threshold, confirming that none are redundant — every variable in the model carries statistically significant explanatory power over room price."}
+```{r lm-drop1, dependson = "lm-fit", fig.cap="Figure 3: F-statistics from drop1() for each predictor in the Linear Model. The red dashed line marks the critical F-value at α = 0.05. All predictors cross the threshold, confirming that none are redundant — every variable in the model carries statistically significant explanatory power over room price."}
 
 drop1_res <- drop1(model_lm, test = "F")
 
@@ -610,7 +640,7 @@ arrivals attract a meaningful price premium over other seasons, consistent with 
 
 A coefficient in a multiple regression reflects the effect of a predictor *after accounting for all other predictors*. To visualise this unambiguously for lead time — the most actionable predictor for pricing strategy — we construct an **added-variable (partial regression) plot**. This plot shows the residual variation in log(ADR) that cannot be explained by any other predictor in the model, plotted against the residual variation in lead time after removing the same set of predictors. The slope of the relationship is therefore the pure, isolated effect of lead time on price.
 
-```{r lm-avplot, fig.cap="Figure 4: Added-variable plot for lead time. The negative slope confirms that longer lead times are genuinely associated with lower room prices — this is not an artefact of confounding with season or market segment."}
+```{r lm-avplot, dependson = "lm-fit", fig.cap="Figure 4: Added-variable plot for lead time. The negative slope confirms that longer lead times are genuinely associated with lower room prices — this is not an artefact of confounding with season or market segment."}
 
 model_no_lt <- lm(
   log_adr ~ arrival_season + MarketSegment + CustomerType +
@@ -646,7 +676,7 @@ ggplot(av_df %>% sample_n(6000), aes(x = resid_lt, y = resid_y)) +
 
 ## Marginal Effect: Translating Lead Time into Euros
 
-```{r lm-marginal, fig.cap="Figure 5: Predicted ADR (€) as a function of lead time for a typical Online TA Transient Summer booking. A last-minute booking commands roughly €20 more per night than one made 200 days in advance."}
+```{r lm-marginal, dependson = "lm-fit", fig.cap="Figure 5: Predicted ADR (€) as a function of lead time for a typical Online TA Transient Summer booking. A last-minute booking commands roughly €20 more per night than one made 200 days in advance."}
 
 lead_seq    <- seq(0, 400, by = 2)
 mean_lt_val <- mean(train_lm$LeadTime, na.rm = TRUE)
@@ -690,7 +720,7 @@ ggplot(newdata_lt, aes(x = lead_seq)) +
 
 ## Model Diagnostics
 
-```{r lm-diagnostics, fig.cap="Figure 6: Residual diagnostics — broadly homoscedastic spread and approximate normality support the adequacy of the log-transformation.", fig.height=4}
+```{r lm-diagnostics, dependson = "lm-fit", fig.cap="Figure 6: Residual diagnostics — broadly homoscedastic spread and approximate normality support the adequacy of the log-transformation.", fig.height=4}
 par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
 plot(model_lm, which = 1, main = "Residuals vs Fitted",
      col = adjustcolor("steelblue", 0.3), pch = 16, cex = 0.5)
@@ -701,7 +731,7 @@ par(mfrow = c(1, 1))
 
 ## Test Set Performance
 
-```{r lm-test}
+```{r lm-test, dependson = "lm-fit"}
 pred_lm  <- predict(model_lm, newdata = test_lm)
 rmse_lm  <- sqrt(mean((pred_lm - test_lm$log_adr)^2))
 r2_test  <- cor(pred_lm, test_lm$log_adr)^2
@@ -712,7 +742,7 @@ cat(sprintf("R² on test set:      %.3f\n", r2_test))
 cat(sprintf("Approx. error in €:  ±€%.1f per night\n", abs(rmse_eur)))
 ```
 
-```{r lm-pred-vs-actual, fig.cap="Figure 7: Predicted vs. observed ADR on the held-out test set. Points cluster tightly around the 45° line, confirming good out-of-sample generalisation."}
+```{r lm-pred-vs-actual, dependson = "lm-test", fig.cap="Figure 7: Predicted vs. observed ADR on the held-out test set. Points cluster tightly around the 45° line, confirming good out-of-sample generalisation."}
 
 data.frame(predicted = pred_lm, observed = test_lm$log_adr) %>%
   sample_n(3000) %>%
@@ -829,7 +859,7 @@ ggplot(mv_data, aes(x = group_mean, y = group_var,
 
 ## Model Fitting and Overdispersion Check
 
-```{r poisson-fit}
+```{r poisson-fit, cache = TRUE}
 set.seed(2026)
 idx_pois   <- createDataPartition(hotel_pois$total_stays, p = 0.8, list = FALSE)
 train_pois <- hotel_pois[idx_pois, ]
@@ -850,7 +880,7 @@ cat(sprintf("→ %s\n",
            "No strong overdispersion — Poisson retained.")))
 ```
 
-```{r quasipoisson-refit}
+```{r quasipoisson-refit, cache = TRUE, dependson = "poisson-fit"}
 if (disp_ratio > 1.5) {
   model_pois <- glm(
     total_stays ~ MarketSegment + CustomerType + arrival_season +
@@ -867,7 +897,7 @@ anova(model_null, model_pois, test = "F")
 
 ## Formal Predictor Testing
 
-```{r poisson-drop1}
+```{r poisson-drop1, dependson = "quasipoisson-refit"}
 drop1(model_pois, test = "F")
 ```
 
@@ -885,7 +915,7 @@ direct implications for targeted marketing.
 
 ## Rate Ratio Forest Plot
 
-```{r poisson-forest, fig.cap="Figure 10: Rate ratios from the quasi-Poisson GLM. Values above 1 indicate longer expected stays than the reference group. Error bars are 95% confidence intervals; blue points are significant at p < 0.05."}
+```{r poisson-forest, dependson = "quasipoisson-refit", fig.cap="Figure 10: Rate ratios from the quasi-Poisson GLM. Values above 1 indicate longer expected stays than the reference group. Error bars are 95% confidence intervals; blue points are significant at p < 0.05."}
 
 pois_tidy <- tidy(model_pois, conf.int = TRUE) %>%
   mutate(
@@ -930,7 +960,7 @@ ggplot(pois_tidy, aes(x = rr, y = reorder(term_clean, rr), colour = significant)
 
 ## Post-Hoc Contrasts: Which Segments Differ?
 
-```{r poisson-glht, fig.cap="Figure 11: Tukey pairwise contrasts between market segments. Blue points indicate statistically significant differences after multiple comparison correction."}
+```{r poisson-glht, dependson = "quasipoisson-refit", fig.cap="Figure 11: Tukey pairwise contrasts between market segments. Blue points indicate statistically significant differences after multiple comparison correction."}
 
 glht_pois <- glht(model_pois, linfct = mcp(MarketSegment = "Tukey"))
 
@@ -964,7 +994,7 @@ ggplot(glht_df, aes(x = rr, y = reorder(Contrast, rr), colour = significant)) +
 
 ## Business Takeaway
 
-```{r poisson-test-performance}
+```{r poisson-test-performance, dependson = "quasipoisson-refit"}
 pred_pois <- predict(model_pois, newdata = test_pois, type = "response")
 mae_pois  <- mean(abs(pred_pois - test_pois$total_stays))
 rmse_pois <- sqrt(mean((pred_pois - test_pois$total_stays)^2))
@@ -974,7 +1004,8 @@ cat(sprintf("RMSE:                %.2f nights\n", rmse_pois))
 
 
 The quasi-Poisson model predicts stay length to within approximately `r round(mae_pois, 1)` nights on the held-out test set — a useful level of accuracy for segment-level planning. The business implication is straightforward: the hotel should prioritise channels and customer types associated with longer stays when capacity allows. Online TA and leisure segments in Summer represent the highest-value long-stay profiles. A targeted promotion, such as a discounted third or fourth night for Online TA bookings made more than 60 days in advance — could meaningfully shift the average stay length upward for this segment, generating incremental revenue with minimal additional operational cost.
----
+
+
 # Model 3: Binomial GLM — Which Bookings Will Cancel?
 
 *Section lead: Lorena Zovkic*
@@ -991,7 +1022,7 @@ Cancellations are the single largest source of revenue uncertainty for the hotel
 
 ## Data Preparation
 
-```{r binomial-prep}
+```{r binomial-prep, cache = TRUE}
 hotel_bin <- hotel_data %>%
   filter(!as.character(MarketSegment) %in% c("Undefined", "Complementary"))
 hotel_bin$MarketSegment <- droplevels(hotel_bin$MarketSegment)
@@ -1031,6 +1062,7 @@ p_dep <- train_bin %>%
   theme_minimal(base_size = 10)
 
 p_lead <- train_bin %>%
+  slice_sample(n = 10000) %>%
   ggplot(aes(x = LeadTime, y = IsCanceled)) +
   geom_smooth(method = "loess", span = 0.35,
               colour = "steelblue", fill = "lightblue", linewidth = 1.2) +
@@ -1053,7 +1085,7 @@ p_dep + p_lead
 
 ## Model Fitting
 
-```{r binomial-fit, cache=TRUE}
+```{r binomial-fit, cache = TRUE, dependson = "binomial-prep"}
 model_binomial <- glm(
   IsCanceled ~ LeadTime + DepositType + MarketSegment +
     PreviousCancellations + TotalOfSpecialRequests +
@@ -1075,7 +1107,7 @@ cat(sprintf("McFadden pseudo-R²: %.3f\n",
 
 As in the Linear Model, we use `drop1()` with a Chi-square test to assess the contribution of each predictor to the overall model. For a Binomial GLM, this tests whether the deviance increases significantly when a predictor is removed — a more rigorous measure of importance than individual coefficient p-values, particularly for multi-level factors.
 
-```{r binomial-drop1, fig.cap="Figure 13: Chi-square statistics from drop1() for each predictor in the Binomial GLM. The red dashed line marks the critical value at α = 0.05. All predictors cross the threshold, confirming that every variable in the model contributes significantly to predicting cancellation.", fig.height=5}
+```{r binomial-drop1, dependson = "binomial-fit", fig.cap="Figure 13: Chi-square statistics from drop1() for each predictor in the Binomial GLM. The red dashed line marks the critical value at α = 0.05. All predictors cross the threshold, confirming that every variable in the model contributes significantly to predicting cancellation.", fig.height=5}
 
 drop1_bin <- drop1(model_binomial, test = "Chisq")
 
@@ -1127,7 +1159,7 @@ Every predictor in the model contributes significantly. The three strongest pred
 
 ## Coefficient Interpretation
 
-```{r binomial-forest, fig.cap="Figure 14: Odds ratios from the Binomial GLM with 95% confidence intervals. Values above 1 increase cancellation odds; values below 1 reduce them. The Non Refund deposit is excluded from this plot due to near-perfect separation (OR ≈ ∞) — discussed separately in the text. All predictors are shown on a log scale so that multiplicative effects appear symmetric.", fig.height=7, fig.width=8}
+```{r binomial-forest, dependson = "binomial-fit", fig.cap="Figure 14: Odds ratios from the Binomial GLM with 95% confidence intervals. Values above 1 increase cancellation odds; values below 1 reduce them. The Non Refund deposit is excluded from this plot due to near-perfect separation (OR ≈ ∞) — discussed separately in the text. All predictors are shown on a log scale so that multiplicative effects appear symmetric.", fig.height=7, fig.width=8}
 
 bin_tidy <- tidy(model_binomial, conf.int = TRUE, exponentiate = TRUE) %>%
   filter(term != "(Intercept)",
@@ -1182,7 +1214,7 @@ Four predictors stand out for practical interpretation:
 
 ## Marginal Effect: How Does Lead Time Translate Into Cancellation Risk?
 
-```{r binomial-marginal, fig.cap="Figure 15: Predicted cancellation probability as a function of lead time for a typical reference booking (Online TA, Transient, No Deposit, Summer, no prior cancellations, one special request, booked via agent). The ribbon shows the 95% confidence interval. A booking made 200 days in advance has a cancellation probability roughly 25 percentage points higher than one made one week out — a practically significant difference for overbooking decisions.", fig.width=8, fig.height=4}
+```{r binomial-marginal, dependson = "binomial-fit", fig.cap="Figure 15: Predicted cancellation probability as a function of lead time for a typical reference booking (Online TA, Transient, No Deposit, Summer, no prior cancellations, one special request, booked via agent). The ribbon shows the 95% confidence interval. A booking made 200 days in advance has a cancellation probability roughly 25 percentage points higher than one made one week out — a practically significant difference for overbooking decisions.", fig.width=8, fig.height=4}
 
 lead_seq_bin <- seq(0, 400, by = 2)
 
@@ -1238,7 +1270,7 @@ ggplot(newdata_bin, aes(x = LeadTime)) +
 
 ## Model Evaluation
 
-```{r binomial-roc, fig.cap="Figure 16: ROC curve for the Binomial GLM on the held-out test set. The AUC measures the model's ability to correctly rank a random cancellation above a random non-cancellation, independent of the decision threshold chosen.", fig.width=6, fig.height=5}
+```{r binomial-roc, dependson = "binomial-fit", fig.cap="Figure 16: ROC curve for the Binomial GLM on the held-out test set. The AUC measures the model's ability to correctly rank a random cancellation above a random non-cancellation, independent of the decision threshold chosen.", fig.width=6, fig.height=5}
 
 pred_probs_bin <- predict(model_binomial, newdata = test_bin, type = "response")
 roc_bin        <- roc(test_bin$IsCanceled, pred_probs_bin, quiet = TRUE)
@@ -1250,7 +1282,7 @@ plot(roc_bin,
 abline(a = 0, b = 1, lty = 2, col = "grey60")
 ```
 
-```{r binomial-confmat}
+```{r binomial-confmat, dependson = "binomial-roc"}
 pred_class_bin <- factor(ifelse(pred_probs_bin > 0.5, 1, 0))
 cm_bin <- caret::confusionMatrix(pred_class_bin,
                                   factor(test_bin$IsCanceled),
@@ -1282,7 +1314,7 @@ Because the GAM uses the same response variable, the same link function, and the
 
 ## Model Fitting
 
-```{r gam-fit, cache=TRUE}
+```{r gam-fit, cache = TRUE, dependson = "binomial-prep"}
 library(mgcv)
 
 model_gam <- gam(
@@ -1304,7 +1336,7 @@ print(round(gam_summ$s.table, 3))
 
 ## Smooth Term Plots
 
-```{r gam-smooths, fig.cap="Figure 17: Estimated smooth terms from the GAM. Each panel shows how one continuous predictor affects the log-odds of cancellation after controlling for all other variables. The shaded band is a 95% confidence interval. The edf reported in each panel title quantifies how nonlinear the relationship is — edf = 1 would be a straight line.", fig.width=11, fig.height=4}
+```{r gam-smooths, dependson = "gam-fit", fig.cap="Figure 17: Estimated smooth terms from the GAM. Each panel shows how one continuous predictor affects the log-odds of cancellation after controlling for all other variables. The shaded band is a 95% confidence interval. The edf reported in each panel title quantifies how nonlinear the relationship is — edf = 1 would be a straight line.", fig.width=11, fig.height=4}
 
 par(mfrow = c(1, 3), mar = c(4, 4, 4, 1))
 plot(model_gam,
@@ -1328,14 +1360,14 @@ Three patterns emerge from the smooth terms:
 
 ## GLM vs GAM: Does Flexibility Pay Off?
 
-```{r gam-aic-compare}
+```{r gam-aic-compare, dependson = c("gam-fit", "binomial-fit")}
 aic_comparison <- AIC(model_binomial, model_gam)
 print(round(aic_comparison, 1))
 cat(sprintf("\nAIC improvement from GLM to GAM: %.1f points\n",
             AIC(model_binomial) - AIC(model_gam)))
 ```
 
-```{r gam-roc, fig.cap="Figure 18: ROC curves for the Binomial GLM (blue) and GAM (red) evaluated on the same held-out test set. The vertical distance between the curves at any point represents the GAM's gain in sensitivity for a given false-positive rate.", fig.width=6, fig.height=5}
+```{r gam-roc, dependson = c("gam-fit", "binomial-roc"), fig.cap="Figure 18: ROC curves for the Binomial GLM (blue) and GAM (red) evaluated on the same held-out test set. The vertical distance between the curves at any point represents the GAM's gain in sensitivity for a given false-positive rate.", fig.width=6, fig.height=5}
 
 gam_probs <- predict(model_gam, newdata = test_bin, type = "response")
 roc_gam   <- roc(test_bin$IsCanceled, gam_probs, quiet = TRUE)
@@ -1351,7 +1383,7 @@ legend("bottomright",
        col = c("steelblue", "tomato"), lwd = 2, bty = "n")
 ```
 
-```{r gam-confmat}
+```{r gam-confmat, dependson = "gam-roc"}
 pred_class_gam <- factor(ifelse(gam_probs > 0.5, 1, 0))
 cm_gam <- caret::confusionMatrix(pred_class_gam,
                                   factor(test_bin$IsCanceled),
@@ -1361,7 +1393,7 @@ cm_gam
 
 ## Marginal Smooth: Lead Time in Probability Units
 
-```{r gam-marginal, fig.cap="Figure 19: Predicted cancellation probability from the GAM as a function of lead time (red), overlaid with the GLM prediction (blue) for the same reference booking. The GAM captures the plateau beyond 150 days that the GLM misses, and the steeper early rise below 50 days. These differences matter operationally — the GLM under-scores short-lead-time bookings and over-scores very long ones.", fig.width=8, fig.height=4}
+```{r gam-marginal, dependson = c("gam-fit", "binomial-fit"), fig.cap="Figure 19: Predicted cancellation probability from the GAM as a function of lead time (red), overlaid with the GLM prediction (blue) for the same reference booking. The GAM captures the plateau beyond 150 days that the GLM misses, and the steeper early rise below 50 days. These differences matter operationally — the GLM under-scores short-lead-time bookings and over-scores very long ones.", fig.width=8, fig.height=4}
 
 newdata_gam <- data.frame(
   LeadTime               = lead_seq_bin,
@@ -1424,7 +1456,8 @@ ggplot() +
 ## Business Takeaway
 
 The GAM achieves an AUC of `r round(auc(roc_gam), 3)` versus `r round(auc(roc_bin), 3)` for the Binomial GLM — an improvement of `r round(auc(roc_gam) - auc(roc_bin), 3)` AUC points on held-out data. The AIC drops by `r round(AIC(model_binomial) - AIC(model_gam), 0)` points, confirming that the flexibility is genuinely justified and not overfitting. The practical implication is most visible in Figure 19: the GLM assigns a steadily increasing cancellation score across all lead times, while the GAM correctly identifies that risk stabilises beyond 150 days. A hotel using the GLM as a scoring engine would flag a 300-day booking at the same risk level as a 200-day booking — the GAM correctly treats them as equivalent, freeing up overbooking capacity that the GLM would unnecessarily reserve. For a risk-scoring system deployed in production, the GAM's additional complexity is well worth the modest implementation overhead.
----
+
+
 # Model 5: Support Vector Machine
 
 *Section lead: [Teammate name]*
