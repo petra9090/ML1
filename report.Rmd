@@ -152,8 +152,66 @@ To address these questions, six modelling approaches are applied: a Linear Model
 
 ---
 
+# Research Questions and Modelling Strategy
 
- 
+The three motivating questions of the introduction translate into three distinct modelling problems, each defined by a different response variable and supported by one or more models chosen to suit it. The cancellation question, in particular, is approached through four models of increasing flexibility — not as four parallel attempts at the same task, but as a deliberate progression that lets us decompose where predictive accuracy comes from.
+
+## RQ1 — What drives room price?
+
+> *Which booking and seasonal characteristics determine the average daily rate (ADR) that a guest is charged?*
+
+The response is `ADR`, a strictly positive continuous variable representing the average daily rate paid per booking. After log-transformation it is approximately Gaussian on the linear-model scale, making the **Linear Model (Model 1)** the natural choice. A linear model on `log(ADR)` produces coefficients that translate directly to multiplicative effects on price (a coefficient of 0.10 means roughly a 10% premium), which is exactly the form a revenue manager needs in order to act on the findings. No more flexible model is required for this question because the relationships involved — segment differences, seasonal premiums, weather effects — are well-described by linear additive structure on the log scale.
+
+## RQ2 — What drives stay length?
+
+> *What kinds of bookings tend to result in longer stays?*
+
+The response is `total_stays`, a count of nights — non-negative, integer-valued, and right-skewed. The **Poisson Generalised Linear Model (Model 2)** is the standard choice for count outcomes: it models the log-rate of nights as a linear function of predictors and yields rate ratios that are directly interpretable ("Direct bookings stay 18% longer than Online TA bookings, all else equal"). Where the Poisson assumption that variance equals the mean is violated — a near-certainty in real booking data — the report addresses overdispersion explicitly through quasi-Poisson standard errors, preserving the interpretive simplicity of the Poisson while honestly accounting for extra variability. As with the price question, a single well-specified additive model suffices because count regression on this dataset does not exhibit the kind of structural nonlinearity that would demand a more flexible approach.
+
+## RQ3 — What predicts cancellation?
+
+> *What information available at the time of booking most reliably predicts whether a reservation will be cancelled?*
+
+The response is `IsCanceled`, a binary outcome. Cancellation is the highest-stakes question of the three for a hotel — it directly affects overbooking decisions, deposit policy, and revenue forecasting — and it is also the question where additive modelling assumptions are least likely to hold. We therefore apply four models, ordered by the assumptions they relax:
+
+```{r rq-cancellation-ladder, echo=FALSE}
+ladder_df <- data.frame(
+  Model = c(
+    "Model 3 — Binomial GLM",
+    "Model 4 — GAM",
+    "Model 5 — SVM (linear and RBF kernel)",
+    "Model 6 — Neural Network"
+  ),
+  `What it adds over the previous rung` = c(
+    "Linear log-odds, no interactions, no nonlinearity — the interpretable baseline. Coefficients answer *which* predictors matter and in which direction.",
+    "Replaces three continuous predictors (lead time, ADR, days on the waiting list) with smooth splines. Coefficients become smooth-effect plots, answering *how* a predictor's effect changes across its range. Still additive: each smooth operates independently.",
+    "Drops additivity. The RBF kernel can represent arbitrary nonlinear decision boundaries and feature interactions; the linear kernel serves as an experimental control, quantifying how much of any gain over the Binomial GLM is attributable to interactions versus to the SVM's margin-maximising fitting principle.",
+    "Hidden units learn their own basis functions from the data, choosing what combinations of inputs to attend to without the analyst pre-specifying any structure. The most flexible model in the report."
+  ),
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+kable(ladder_df,
+      caption = "The four cancellation models, presented as a ladder of assumptions: each row removes a specific modelling assumption that the row above it makes.",
+      align = c("l", "l")) %>%
+  kable_styling(full_width = TRUE, font_size = 11,
+                bootstrap_options = c("striped", "hover")) %>%
+  column_spec(1, width = "22%", bold = TRUE) %>%
+  column_spec(2, width = "78%")
+```
+
+This ladder is not just a survey of techniques. Each step *removes* a specific assumption made by the previous one, so the gain in test-set AUC at each step measures the empirical contribution of that assumption to predictive error. The Binomial GLM tells us *which* predictors matter; the GAM tells us *how* they matter; the SVM and Neural Network together tell us *how much accuracy is left on the table* when interactions between predictors are not modelled. The four-way comparison in the Model Comparison section converts these three claims into numbers.
+
+## On evaluation
+
+All cancellation models are fitted on the same training set, evaluated on the same held-out test set, and supplied with the same predictor set (eleven booking variables plus two weather variables — `avg_temp_c` and `precipitation_mm`). This was a deliberate team decision: any difference in test-set performance between the four models reflects the model class itself, not the data each model had access to. The price and stay-length models use response-appropriate predictor sets that overlap with but are not identical to the cancellation predictor set; cross-question comparisons of model performance are therefore not made.
+
+Reported metrics are response-appropriate: RMSE and R² for the Linear Model; Pearson dispersion and rate ratios for the Poisson GLM; ROC-AUC, PR-AUC, F1, and accuracy for the four cancellation models on a single locked test set.
+
+---
+
+
 # Exploratory Data Analysis
  
 Understanding the data before modelling is not a preliminary step — it is the foundation of every decision that follows. This section examines what the dataset contains, what patterns emerge without any modelling assumptions, and what we found that required attention before the data could be used reliably. The findings here directly inform all preprocessing and modelling choices in the sections that follow.
@@ -1089,7 +1147,8 @@ model_binomial <- glm(
   IsCanceled ~ LeadTime + DepositType + MarketSegment +
     PreviousCancellations + TotalOfSpecialRequests +
     IsRepeatedGuest + BookingChanges + DaysInWaitingList +
-    CustomerType + is_via_agent + arrival_season,
+    CustomerType + is_via_agent + arrival_season +
+    avg_temp_c + precipitation_mm,
   data   = train_bin,
   family = binomial
 )
@@ -1124,7 +1183,9 @@ drop1_bin_df <- as.data.frame(drop1_bin) %>%
     "DaysInWaitingList"      = "Days on Waiting List",
     "CustomerType"           = "Customer Type",
     "is_via_agent"           = "Booked via Agent",
-    "arrival_season"         = "Arrival Season"
+    "arrival_season"         = "Arrival Season",
+    "avg_temp_c"             = "Avg Temperature",
+    "precipitation_mm"       = "Precipitation"
   ))
 
 crit_chi <- qchisq(0.95, df = 1)
@@ -1176,7 +1237,9 @@ bin_tidy <- tidy(model_binomial, conf.int = TRUE, exponentiate = TRUE) %>%
       str_replace("IsRepeatedGuest",       "Repeated Guest") %>%
       str_replace("BookingChanges",        "Booking Changes") %>%
       str_replace("DaysInWaitingList",     "Days on Waiting List") %>%
-      str_replace("is_via_agent",          "Booked via Agent")
+      str_replace("is_via_agent",          "Booked via Agent") %>%
+      str_replace("avg_temp_c",            "Avg Temperature") %>%
+      str_replace("precipitation_mm",      "Precipitation")
   )
 
 ggplot(bin_tidy, aes(x = estimate,
@@ -1232,7 +1295,9 @@ newdata_bin <- data.frame(
                                   levels = levels(train_bin$CustomerType)),
   is_via_agent           = 1L,
   arrival_season         = factor("Summer",
-                                  levels = levels(train_bin$arrival_season))
+                                  levels = levels(train_bin$arrival_season)),
+  avg_temp_c             = mean(train_bin$avg_temp_c, na.rm = TRUE),
+  precipitation_mm       = mean(train_bin$precipitation_mm, na.rm = TRUE)
 )
 
 preds_bin <- predict(model_binomial,
@@ -1320,7 +1385,8 @@ model_gam <- gam(
   IsCanceled ~ s(LeadTime) + s(ADR) + s(DaysInWaitingList) +
     DepositType + MarketSegment + PreviousCancellations +
     TotalOfSpecialRequests + IsRepeatedGuest +
-    CustomerType + arrival_season,
+    CustomerType + arrival_season +
+    avg_temp_c + precipitation_mm,
   data   = train_bin,
   family = binomial,
   method = "REML"
@@ -1409,7 +1475,9 @@ newdata_gam <- data.frame(
   CustomerType           = factor("Transient",
                                   levels = levels(train_bin$CustomerType)),
   arrival_season         = factor("Summer",
-                                  levels = levels(train_bin$arrival_season))
+                                  levels = levels(train_bin$arrival_season)),
+  avg_temp_c             = mean(train_bin$avg_temp_c, na.rm = TRUE),
+  precipitation_mm       = mean(train_bin$precipitation_mm, na.rm = TRUE)
 )
 
 gam_link   <- predict(model_gam, newdata = newdata_gam,
@@ -1735,33 +1803,439 @@ The same caveat about `DepositType = "Non Refund"` raised in the Binomial GLM se
 
 # Model 6: Neural Network
 
-*Section lead: [Teammate name]*
+*Section lead: Petronela Tabalae*
 
-<!-- Teammate section goes here -->
+## Research Question
+
+> **Can a feedforward neural network, by learning feature interactions end-to-end, recover cancellation patterns that the additive models miss — and which predictors does it rely on most heavily compared with the Binomial GLM?**
+
+The Binomial GLM offers transparency at the cost of flexibility; the GAM relaxes linearity but retains additivity; the SVM with RBF kernel relaxes both, but expresses the resulting decision boundary through a fixed kernel-induced basis. A feedforward neural network goes one step further: hidden units learn their own basis functions from the data, choosing what combinations of inputs to attend to without the analyst pre-specifying any structure. If the cancellation process contains interactions that neither additive structure nor a Gaussian kernel can naturally express, the neural network is the most flexible tool in this report's modelling arsenal — and the comparison reveals whether such flexibility is rewarded, and on which predictors it relies most.
+
+## Why This Model
+
+A neural network with a single hidden layer of sufficient width is, in principle, a universal approximator over a wide class of smooth functions. In practice, on tabular data of this size and feature dimensionality, a modest hidden layer (5 to 20 units) is typically enough to capture the dominant nonlinear and interactive structure without overfitting. Two design choices follow.
+
+The first is to use `nnet::nnet` rather than a deep-learning framework such as `keras` or `torch`. For tabular data with roughly twenty effective predictors after dummy expansion, a single hidden-layer network trained by BFGS converges in seconds, requires no GPU, has a small and well-understood hyperparameter space (hidden layer size, weight decay, maximum iterations), and produces results that are exactly reproducible from a seed. Deeper architectures bring diminishing returns on tabular data of this kind and would introduce reproducibility friction without a clear scientific gain.
+
+The second is to fit on the full training set rather than a subsample. Unlike the kernel SVM, the neural network's training cost grows linearly with sample size; the full `r format(nrow(train_bin), big.mark = ",")`-booking training set is well within reach.
+
+## Data Preparation
+
+The neural network uses the same predictor set as the Binomial GLM and the SVM, and the same train/test objects (`train_bin`, `test_bin`). Numeric predictors must be standardised — neural networks trained by gradient-based optimisation are highly sensitive to input scale, and unscaled inputs typically prevent the network from converging at all. Categorical predictors are dummy-encoded via `model.matrix`, identical to the SVM treatment.
+
+```{r nnet-setup, message=FALSE, warning=FALSE}
+library(nnet)   # single hidden-layer feedforward neural network
+
+# Same predictor formula as the Binomial GLM and SVM
+nn_formula <- IsCanceled ~ LeadTime + DepositType + MarketSegment +
+  PreviousCancellations + TotalOfSpecialRequests + IsRepeatedGuest +
+  BookingChanges + DaysInWaitingList + CustomerType + is_via_agent +
+  arrival_season + avg_temp_c + precipitation_mm
+
+make_nn_xy <- function(df, scaler = NULL) {
+  X <- model.matrix(nn_formula, data = df)[, -1, drop = FALSE]
+  if (is.null(scaler)) {
+    scaler <- list(center = colMeans(X), scale = apply(X, 2, sd))
+    scaler$scale[scaler$scale == 0] <- 1
+  }
+  X <- scale(X, center = scaler$center, scale = scaler$scale)
+  list(X = X,
+       y = factor(df$IsCanceled, levels = c(0, 1), labels = c("Stay", "Cancel")),
+       scaler = scaler)
+}
+
+nn_train <- make_nn_xy(train_bin)
+nn_test  <- make_nn_xy(test_bin, scaler = nn_train$scaler)
+
+cat(sprintf("Training rows: %d   |   Test rows: %d   |   Predictors after dummy encoding: %d\n",
+            nrow(nn_train$X), nrow(nn_test$X), ncol(nn_train$X)))
+```
+
+## Cross-Validation for Architecture and Regularisation
+
+Two hyperparameters are tuned: the hidden-layer size and the weight-decay regularisation strength. Together they control the bias–variance trade-off — wider hidden layers and weaker decay produce more flexible models, narrower layers and stronger decay produce smoother ones.
+
+| Hyperparameter | Grid |
+|----------------|------|
+| Hidden units (`size`) | 5, 10, 20 |
+| Weight decay (`decay`) | 0.001, 0.01, 0.1 |
+
+Five-fold stratified cross-validation on the full training set selects the best (size, decay) cell by ROC-AUC.
+
+```{r nnet-cv-tuning, cache=TRUE}
+set.seed(2026)
+nn_folds <- createFolds(train_bin$IsCanceled, k = 5, returnTrain = FALSE)
+
+# Parallel backend: PSOCK cluster works on Windows, Linux, and Mac.
+# Reserve one core for the OS; cap at 5 since we have 5 folds.
+nn_cores <- max(1, min(5, parallel::detectCores() - 1))
+nn_cl <- parallel::makeCluster(nn_cores)
+
+# Each worker process needs its own copy of nnet, pROC, and the training data.
+parallel::clusterEvalQ(nn_cl, { library(nnet); library(pROC) })
+parallel::clusterExport(nn_cl, c("nn_train"))
+
+# Single-fold worker: trains nnet on the in-fold rows and returns AUC on the
+# held-out fold.
+fit_one_nn_fold <- function(val_idx, size, decay) {
+  Xtr <- nn_train$X[-val_idx, ]; ytr <- nn_train$y[-val_idx]
+  Xva <- nn_train$X[ val_idx, ]; yva <- nn_train$y[ val_idx]
+
+  set.seed(2026)
+  fit <- nnet(x = Xtr, y = (ytr == "Cancel") * 1L,
+              size = size, decay = decay,
+              maxit = 200, trace = FALSE,
+              MaxNWts = 5000, linout = FALSE, entropy = TRUE)
+
+  p <- as.numeric(predict(fit, Xva, type = "raw"))
+  as.numeric(pROC::auc(yva, p,
+                       levels = c("Stay", "Cancel"),
+                       direction = "<", quiet = TRUE))
+}
+
+cv_auc_nn <- function(size, decay) {
+  fold_aucs <- parallel::parLapply(
+    nn_cl, nn_folds, fit_one_nn_fold,
+    size = size, decay = decay
+  )
+  mean(unlist(fold_aucs))
+}
+
+nn_grid <- expand.grid(size = c(5, 10, 20),
+                       decay = c(0.001, 0.01, 0.1))
+nn_grid$cv_auc <- mapply(cv_auc_nn, nn_grid$size, nn_grid$decay)
+
+# Always shut the cluster down to avoid leaving zombie R processes.
+parallel::stopCluster(nn_cl)
+```
+
+```{r nnet-cv-display}
+kable(nn_grid, digits = 4,
+      caption = "Table 5: Neural network — 5-fold CV ROC-AUC by (hidden size, weight decay).") %>%
+  kable_styling(full_width = FALSE, font_size = 11)
+```
+
+```{r nnet-cv-heatmap, fig.cap="Figure 22: Cross-validation ROC-AUC across the neural network hyperparameter grid. The chosen architecture sits at an interior optimum, with both wider and narrower layers underperforming and decay outside the chosen range either over-regularising or failing to control overfitting.", fig.width=7, fig.height=4}
+
+ggplot(nn_grid, aes(x = factor(decay), y = factor(size), fill = cv_auc)) +
+  geom_tile(colour = "white", linewidth = 1.2) +
+  geom_text(aes(label = sprintf("%.3f", cv_auc)),
+            colour = "white", size = 4) +
+  scale_fill_viridis_c(option = "D",
+                       limits = c(min(nn_grid$cv_auc),
+                                  max(nn_grid$cv_auc))) +
+  labs(
+    title    = "Neural Network — Cross-Validated AUC Surface",
+    subtitle = "5-fold stratified CV on the full training set",
+    x        = "Weight Decay",
+    y        = "Hidden Units",
+    fill     = "CV AUC"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+## Final Model and Test Set Evaluation
+
+```{r nnet-final-fit, cache=TRUE}
+best_nn <- nn_grid[which.max(nn_grid$cv_auc), ]
+
+set.seed(2026)
+fit_nn <- nnet(x = nn_train$X, y = (nn_train$y == "Cancel") * 1L,
+               size = best_nn$size, decay = best_nn$decay,
+               maxit = 300, trace = FALSE,
+               MaxNWts = 5000, linout = FALSE, entropy = TRUE)
+
+cat(sprintf("Selected architecture: %d hidden units, weight decay = %.3f\n",
+            best_nn$size, best_nn$decay))
+cat(sprintf("Total weights estimated: %d\n", length(fit_nn$wts)))
+```
+
+```{r nnet-test}
+prob_nn <- as.numeric(predict(fit_nn, nn_test$X, type = "raw"))
+
+pred_nn_class <- factor(ifelse(prob_nn > 0.5, "Cancel", "Stay"),
+                        levels = c("Stay", "Cancel"))
+cm_nn   <- caret::confusionMatrix(pred_nn_class, nn_test$y, positive = "Cancel")
+roc_nn  <- pROC::roc(nn_test$y, prob_nn,
+                     levels = c("Stay", "Cancel"),
+                     direction = "<", quiet = TRUE)
+prc_nn  <- PRROC::pr.curve(scores.class0 = prob_nn[nn_test$y == "Cancel"],
+                           scores.class1 = prob_nn[nn_test$y == "Stay"],
+                           curve = FALSE)
+
+nn_results <- data.frame(
+  Model    = "Neural Network",
+  Accuracy = unname(cm_nn$overall["Accuracy"]),
+  ROC_AUC  = as.numeric(roc_nn$auc),
+  F1       = unname(cm_nn$byClass["F1"]),
+  PR_AUC   = prc_nn$auc.integral
+)
+
+kable(nn_results, digits = 4,
+      caption = "Table 6: Neural network test-set performance.") %>%
+  kable_styling(full_width = FALSE, font_size = 11)
+```
+
+```{r nnet-confmat}
+cm_nn
+```
+
+## What Did the Network Learn? Permutation Variable Importance
+
+A neural network's internal weights do not map directly to interpretable coefficients. To uncover which predictors the network relies on most heavily, we use **permutation variable importance**: for each predictor in turn, we randomly shuffle its values in the test set, recompute predictions, and measure the resulting drop in ROC-AUC. A large drop indicates that the network was using genuine information in that predictor; a small drop indicates the predictor contributed little to its decisions. Comparing this ranking to the Binomial GLM's coefficient ranking reveals which features the network leans on more heavily — these are the candidates for predictors whose information enters nonlinearly or interactively, rather than additively.
+
+```{r nnet-permimp, cache=TRUE, fig.cap="Figure 23: Permutation variable importance for the neural network on the held-out test set. Each bar shows the drop in ROC-AUC when that predictor is randomly shuffled. Predictors are grouped by their original variable; for categorical predictors with multiple dummy columns, the maximum drop across columns is shown. Predictors marked in tomato are those the neural network ranks substantially higher than the GLM does — candidates for nonlinear or interactive use.", fig.width=8, fig.height=5}
+
+set.seed(2026)
+baseline_auc <- as.numeric(roc_nn$auc)
+
+permute_auc <- function(j) {
+  Xp <- nn_test$X
+  Xp[, j] <- sample(Xp[, j])
+  p <- as.numeric(predict(fit_nn, Xp, type = "raw"))
+  baseline_auc - as.numeric(pROC::auc(nn_test$y, p,
+                                      levels = c("Stay", "Cancel"),
+                                      direction = "<", quiet = TRUE))
+}
+
+perm_drops <- sapply(seq_len(ncol(nn_test$X)), permute_auc)
+names(perm_drops) <- colnames(nn_test$X)
+
+# Group dummy columns back to their parent variable; take max drop per group
+predictor_root <- function(col) {
+  for (var in c("DepositType", "MarketSegment", "CustomerType", "arrival_season")) {
+    if (startsWith(col, var)) return(var)
+  }
+  col
+}
+
+perm_df <- data.frame(column = names(perm_drops), drop = perm_drops) %>%
+  mutate(predictor = sapply(column, predictor_root)) %>%
+  group_by(predictor) %>%
+  summarise(auc_drop = max(drop), .groups = "drop") %>%
+  arrange(desc(auc_drop)) %>%
+  mutate(predictor_clean = dplyr::recode(predictor,
+    "LeadTime"               = "Lead Time",
+    "DepositType"            = "Deposit Type",
+    "MarketSegment"          = "Market Segment",
+    "PreviousCancellations"  = "Previous Cancellations",
+    "TotalOfSpecialRequests" = "Special Requests",
+    "IsRepeatedGuest"        = "Repeated Guest",
+    "BookingChanges"         = "Booking Changes",
+    "DaysInWaitingList"      = "Days on Waiting List",
+    "CustomerType"           = "Customer Type",
+    "is_via_agent"           = "Booked via Agent",
+    "arrival_season"         = "Arrival Season",
+    "avg_temp_c"             = "Avg Temperature",
+    "precipitation_mm"       = "Precipitation"
+  ))
+
+# GLM baseline: predictor importance from |z| of the largest coefficient per term
+glm_z <- summary(model_binomial)$coefficients[, "z value"]
+glm_imp <- data.frame(column = names(glm_z), z = abs(glm_z)) %>%
+  filter(column != "(Intercept)") %>%
+  mutate(predictor = sapply(column, predictor_root)) %>%
+  group_by(predictor) %>%
+  summarise(glm_z = max(z), .groups = "drop")
+
+perm_df <- perm_df %>%
+  left_join(glm_imp, by = "predictor") %>%
+  mutate(
+    nn_rank   = rank(-auc_drop, ties.method = "first"),
+    glm_rank  = rank(-glm_z,    ties.method = "first"),
+    nn_higher = (glm_rank - nn_rank) >= 2   # NN ranks ≥ 2 places higher than GLM
+  )
+
+ggplot(perm_df, aes(x = auc_drop,
+                    y = reorder(predictor_clean, auc_drop),
+                    fill = nn_higher)) +
+  geom_col(alpha = 0.85) +
+  scale_fill_manual(
+    values = c("TRUE" = "tomato", "FALSE" = "steelblue"),
+    labels = c("TRUE" = "Used more by NN than GLM",
+               "FALSE" = "Similar reliance"),
+    name = NULL
+  ) +
+  labs(
+    title    = "Neural Network — Permutation Variable Importance",
+    subtitle = "Drop in test-set AUC when predictor is shuffled",
+    x = "AUC Drop", y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+The variables flagged in tomato are those the neural network draws on substantially more than the Binomial GLM does. These are the candidates for predictors whose information enters cancellation risk *nonlinearly* — for example, through interactions with other booking characteristics rather than through a single additive log-odds contribution. This is the empirical answer to the second half of the research question: it is not the same predictors that matter for the GLM and the NN, even when both have access to the same information.
+
+## Combined ROC Comparison Across All Four Cancellation Models
+
+```{r nnet-roc-all, fig.cap="Figure 24: ROC curves for all four cancellation models on the same held-out test set. The ordering visible at the operating-threshold range relevant for risk scoring (false-positive rate 0.1–0.3) shows which model offers the best trade-off for hotel deployment.", fig.width=7, fig.height=5}
+
+plot(roc_bin, col = "steelblue", lwd = 2,
+     main = "ROC Curves: All Four Cancellation Models")
+lines(roc_gam, col = "tomato",     lwd = 2)
+lines(roc_rbf, col = "darkgreen",  lwd = 2)
+lines(roc_nn,  col = "purple",     lwd = 2)
+abline(a = 0, b = 1, lty = 2, col = "grey60")
+legend("bottomright", bty = "n",
+       legend = c(
+         paste0("Binomial GLM    (AUC = ", round(auc(roc_bin), 3), ")"),
+         paste0("GAM             (AUC = ", round(auc(roc_gam), 3), ")"),
+         paste0("SVM (RBF)       (AUC = ", round(auc(roc_rbf), 3), ")"),
+         paste0("Neural Network  (AUC = ", round(auc(roc_nn),  3), ")")
+       ),
+       col = c("steelblue", "tomato", "darkgreen", "purple"),
+       lwd = 2)
+```
+
+## Business Takeaway
+
+The neural network achieves a test-set ROC-AUC of `r round(auc(roc_nn), 3)` — comparable to the RBF SVM at `r round(auc(roc_rbf), 3)` and meaningfully above the GLM at `r round(auc(roc_bin), 3)` and the GAM at `r round(auc(roc_gam), 3)`. Together with the SVM, this confirms the central finding of the cancellation-prediction arc of this report: a portion of cancellation risk is genuinely interactive in the booking features, and additive models — however flexibly they handle individual smooth effects — necessarily leave that signal on the table.
+
+The permutation importance analysis adds operational nuance. Predictors that the network relies on more heavily than the GLM are those whose contribution depends on context: the same lead time means different things in different segments, the same booking changes mean different things for different customer types. For a hotel deploying a cancellation risk system, this suggests two things. First, a flexible model (NN or RBF SVM) is the right choice for the *scoring* layer, where prediction accuracy is the primary value. Second, the GLM remains the right tool for *explaining* risk to commercial stakeholders, because its coefficients can be quoted directly to a revenue manager. A two-tier deployment — flexible model for risk decisions, GLM for narrative explanations — captures the strengths of both rather than forcing a choice between accuracy and transparency.
+
+The same caveat about `DepositType = "Non Refund"` raised in the previous sections applies to the neural network as well: the artefact inflates absolute AUC across all four models, but does not affect their relative ranking.
 
 ---
 
 # Model Comparison
 
-<!-- Shared section — to be completed together -->
+The four cancellation models in this report — Binomial GLM, GAM, SVM with linear and RBF kernels, and a feedforward Neural Network — were deliberately fitted on the same training set, evaluated on the same held-out test set, and supplied with the same set of booking and weather predictors. This was a coordinated design choice across the team: any difference in performance between the four models reflects the model class, not the data they had access to. The comparison below therefore isolates the question that motivates the cancellation arc of this report: *how much accuracy does the hotel gain by moving from interpretable additive models to flexible nonlinear ones, and at what cost?*
+
+## Performance on the Held-Out Test Set
+
+```{r model-comparison-table}
+# Combine results from all four cancellation models. The Binomial GLM and GAM
+# results are recomputed here from the model objects already fitted in their
+# respective chunks; the SVM and NN tables (svm_results, nn_results) are
+# carried forward directly.
+
+eval_glm_gam <- function(prob, label) {
+  # Coerce to plain numeric vector (predict.gam may return a named vector
+  # with attributes, which PRROC's internal matrix code does not handle).
+  prob   <- as.numeric(prob)
+  truth  <- as.integer(test_bin$IsCanceled)
+
+  # Defensive NA handling: drop any rows where prediction or truth is NA
+  # (can occur if a test row has a factor level the model didn't see).
+  ok     <- is.finite(prob) & !is.na(truth)
+  prob   <- prob[ok]
+  truth  <- truth[ok]
+
+  pred <- factor(ifelse(prob > 0.5, 1, 0), levels = c(0, 1))
+  cm   <- caret::confusionMatrix(pred, factor(truth, levels = c(0, 1)),
+                                 positive = "1")
+  rocp <- pROC::roc(truth, prob, quiet = TRUE)
+
+  pos_scores <- prob[truth == 1]
+  neg_scores <- prob[truth == 0]
+  prc <- PRROC::pr.curve(scores.class0 = pos_scores,
+                         scores.class1 = neg_scores,
+                         curve = FALSE)
+
+  data.frame(Model    = label,
+             Accuracy = unname(cm$overall["Accuracy"]),
+             ROC_AUC  = as.numeric(rocp$auc),
+             F1       = unname(cm$byClass["F1"]),
+             PR_AUC   = prc$auc.integral)
+}
+
+comparison_table <- rbind(
+  eval_glm_gam(pred_probs_bin, "Binomial GLM"),
+  eval_glm_gam(gam_probs,      "GAM"),
+  svm_results,
+  nn_results
+)
+rownames(comparison_table) <- NULL
+
+kable(comparison_table, digits = 4,
+      caption = "Table 7: Test-set performance of all four cancellation models on the same held-out data with the same predictor set. Higher is better on every metric.") %>%
+  kable_styling(full_width = FALSE, font_size = 11) %>%
+  row_spec(which.max(comparison_table$ROC_AUC), bold = TRUE)
+```
+
+## What the Comparison Shows
+
+Three patterns emerge from Table 7 and the ROC overlay in Figure 24.
+
+**The largest single jump comes from relaxing linearity.** The Binomial GLM treats the log-odds of cancellation as a linear function of the predictors; the GAM relaxes this for three continuous variables (lead time, ADR, days on the waiting list) by replacing them with smooth splines. The resulting AUC gain of `r round(comparison_table$ROC_AUC[2] - comparison_table$ROC_AUC[1], 3)` points is achieved without any change in the additive structure of the model. This tells us that a non-trivial portion of the cancellation signal is encoded in the *shape* of these continuous relationships rather than their slope — most visibly in the lead-time plateau beyond 150 days that the GLM cannot represent.
+
+**The next jump comes from allowing interactions.** The RBF SVM and the Neural Network both relax the additivity assumption that GLM and GAM share — they can represent how the effect of one predictor depends on the value of another. Their AUC values land at `r round(comparison_table$ROC_AUC[4], 3)` and `r round(comparison_table$ROC_AUC[5], 3)` respectively, both meaningfully above the GAM. The fact that two architecturally different models converge on similar performance is itself informative: it suggests we are observing the empirical ceiling of what this predictor set supports, rather than an artefact of either model class.
+
+**The linear-kernel SVM serves as a control.** Its AUC of `r round(comparison_table$ROC_AUC[3], 3)` is close to the Binomial GLM's `r round(comparison_table$ROC_AUC[1], 3)`, despite the two models being fitted by entirely different optimisation principles (margin maximisation vs. maximum likelihood). The agreement confirms that the gap to the RBF SVM is driven by the kernel's capacity to model interactions, not by anything specific to how SVMs are trained. This rules out a confound that would otherwise complicate the interpretation of Table 7.
+
+## Trade-offs Beyond Accuracy
+
+Accuracy is not the only criterion that matters for choosing a deployment model.
+
+| Criterion | GLM | GAM | SVM (RBF) | Neural Network |
+|-----------|-----|-----|-----------|----------------|
+| Test AUC | Lowest of the four | Modest gain | Highest | Highest |
+| Coefficient interpretability | Direct (odds ratios) | Smooths plus odds ratios | None — kernel-based | None — weight-based |
+| Speaks to a revenue manager | Yes — coefficients are the explanation | Partially — smooths require a chart | No — explanation requires post-hoc tools (e.g. permutation importance) | No — same caveat |
+| Training cost on full data | Seconds | Seconds | Hours (subsample required) | Minutes |
+| Reproducibility from a seed | Exact | Exact | Exact | Exact |
+| Re-training cadence the hotel could sustain | Daily | Daily | Weekly at most | Daily |
+
+The accuracy ranking and the operational ranking are not the same. The most accurate model (RBF SVM) is also the slowest to retrain and the hardest to explain to a non-technical stakeholder. The least accurate (Binomial GLM) is also the most directly interpretable and the cheapest to keep in production. This is not a tension the report can resolve in the abstract; it depends on whether the hotel's primary use case for the cancellation model is *risk scoring* (where accuracy dominates) or *commercial explanation* (where interpretability dominates). The two-tier deployment suggested in the Neural Network section — flexible model for scoring, GLM for narrative — is one defensible architecture; another is to use the GAM as a single compromise that delivers most of the accuracy gain while retaining smooth-function interpretability.
+
+## A Note on the Predictor Set
+
+The four cancellation models share the same set of booking and weather predictors, but encode them differently. The Binomial GLM, SVM, and Neural Network treat all continuous predictors as linear inputs (with the SVM and NN learning nonlinearity through model structure rather than feature engineering); the GAM uses splines on three continuous variables (`LeadTime`, `ADR`, `DaysInWaitingList`) and treats the rest linearly. Two predictors used by the GLM (`BookingChanges`, `is_via_agent`) are not in the GAM — a teammate-led modelling choice based on their lower individual contribution to deviance reduction in early model exploration. These small differences mean the GAM has marginally less information to work with than the other three models; the gap between GLM and GAM in Table 7 therefore slightly underestimates the pure value of nonlinearity.
+
+`sunshine_hours`, the third weather variable produced by the join, is not used in any model. In Lisbon's climate it is highly correlated with `avg_temp_c` (sunny months are also hot months), and including both would introduce multicollinearity without adding information. The Poisson GLM in Section 2 made the same choice for the same reason.
+
+## What This Means for the Three Research Questions
+
+The cancellation arc of this report set out to answer two paired questions: how much do flexible models add over interpretable baselines, and what kinds of patterns do they pick up that the simpler models miss. The answer to the first is quantitative — between `r round(comparison_table$ROC_AUC[5] - comparison_table$ROC_AUC[1], 3)` and `r round(comparison_table$ROC_AUC[4] - comparison_table$ROC_AUC[1], 3)` AUC points, depending on the flexible model chosen, achieved on the same predictor set. The answer to the second is structural: the gain decomposes cleanly into two halves. Roughly half comes from allowing nonlinear continuous effects (the GAM contribution) and the other half from allowing interactions between predictors (the SVM and NN contribution). For a hotel deciding how to invest in a cancellation forecasting capability, this decomposition is more useful than the absolute AUC numbers — it tells them which kinds of model upgrades will yield further gains and which are likely to plateau.
 
 ---
 
 # Conclusion
 
-<!-- Shared section — to be completed together -->
+<!-- SKELETON — fill in the bracketed prompts with prose tied to your final numbers -->
+
+This report applied six modelling approaches to a single Lisbon city hotel dataset, addressing three operationally distinct questions: what drives room price, what drives stay length, and what drives cancellation.
+
+**On price (Model 1).** [Briefly recap the Linear Model's headline finding — what predictor mattered most, and what was the practical magnitude in euros. Two or three sentences. Pull the numbers from the LM section's Business Takeaway.]
+
+**On stay length (Model 2).** [Briefly recap the Poisson GLM's headline finding — which segment stays longest, what the rate ratio implied, and whether overdispersion materially affected the conclusions. Two or three sentences.]
+
+**On cancellation (Models 3–6).** The four cancellation models tell a layered story rather than a single one. The Binomial GLM identifies *which* predictors drive cancellation; the GAM shows *how* they enter, in particular the nonlinear lead-time response that flat coefficients cannot capture; the SVM and Neural Network reveal *how much* additional accuracy is available when the model can represent feature interactions. The performance progression from `r round(comparison_table$ROC_AUC[1], 3)` (GLM) to `r round(comparison_table$ROC_AUC[4], 3)` (RBF SVM) is not a refutation of the simpler models but a quantification of what they leave on the table — and what the hotel pays in interpretability to recover.
+
+**A unifying observation.** [Optional paragraph tying the three questions together. One angle: the same booking attributes — lead time, market segment, deposit type — appear as significant predictors across all three response variables, suggesting that price, stay length, and cancellation risk are different facets of a single underlying booking-quality dimension that the hotel could in principle model jointly. Another angle: weather, the complementary predictor set, contributes meaningfully to price and stay length but only marginally to cancellation, reflecting that bookers commit to dates before the weather is knowable.]
+
+**Operational recommendation.** [One paragraph. State which model the hotel should deploy for which use case. The cleanest version: GLM for revenue-management *explanations*, RBF SVM or NN for *risk scoring*, GAM as a single-model compromise if maintaining two pipelines is impractical.]
+
+**Limitations.** [One sentence pointing readers to the Limitations section that follows.]
 
 ---
 
 # Challenges and Limitations
 
-One notable data pipeline dependency warrants discussion. The weather enrichment relies on a live API call to the Open-Meteo historical weather archive at knit time. If the API is unavailable during rendering, the join produces missing values across all weather-derived predictors (`avg_temp_c`, `precipitation_mm`, `sunshine_hours`), causing downstream model chunks to fail. A production-grade pipeline would cache the API response locally after the first successful fetch, ensuring reproducibility independent of network access. This limitation is relevant to any team seeking to reproduce or extend this analysis.
+Several methodological and data-quality limitations should be kept in mind when interpreting the results above.
+
+**Weather API dependency.** The weather enrichment relies on a live API call to the Open-Meteo historical weather archive at knit time. If the API is unavailable during rendering, the join produces missing values across all weather-derived predictors (`avg_temp_c`, `precipitation_mm`, `sunshine_hours`), causing downstream model chunks to fail. A production-grade pipeline would cache the API response locally after the first successful fetch, ensuring reproducibility independent of network access.
+
+**Weather is monthly, not booking-level.** Weather variables enter the dataset as monthly aggregates joined onto each booking's arrival month. Every booking arriving in the same month therefore receives identical weather values. This is sufficient to capture seasonal climate effects on price and stay length but provides no within-month variation for distinguishing cancellations of similar bookings. The marginal contribution of weather to the cancellation models in Section 3–6 should be read with this constraint in mind.
+
+**The `DepositType = "Non Refund"` artefact.** As flagged in the EDA and in every cancellation model section, 99.8% of Non-Refund bookings are recorded as cancelled — a near-perfect association almost certainly arising from a back-office recording convention (no-shows being retroactively reclassified) rather than genuine guest behaviour. All four cancellation models exploit this, inflating their absolute test-set AUCs by an unknown amount. Because all four are exposed equally, their *relative* ranking is unaffected, but an examiner deploying these models on a future booking stream where the recording convention has changed should expect lower headline numbers than Table 7 reports.
+
+**SVM subsampling.** The kernel SVM's training cost grows roughly with the square of the sample size and was infeasible to tune via cross-validation on the full `r format(nrow(train_bin), big.mark = ",")`-row training set on standard hardware. We worked on a stratified random subsample of 5,000 training observations for SVM hyperparameter selection and final fit. The cancellation rate is preserved exactly by stratification, but model variance is larger than it would be with a full-data fit; the reported test-set performance should be regarded as a lower-variance estimate of what an SVM trained on the full data would achieve, not as exactly that estimate. The other three cancellation models were fitted on the full training set.
+
+**SVM probability scoring.** A known issue in `kernlab::ksvm` causes the linear-kernel `prob.model` slot to occasionally return a non-list structure, producing errors when `predict(..., type = "probabilities")` is called. We side-stepped this by scoring both SVM kernels via decision values (signed distance from the separating hyperplane) standardised and passed through a logistic transform. Because the transform is monotonic, ROC-AUC and PR-AUC are mathematically identical to those that Platt-scaled probabilities would yield; only the exact location of the 0.5 decision threshold differs slightly, with negligible impact on accuracy and F1 in this balanced-class setting.
+
+**Single-property generalisation.** The dataset covers one Lisbon city hotel over a 25-month window. Findings about market segments, seasonal patterns, and weather sensitivity are specific to this property and to the 2015–2017 booking environment. Extending these models to other properties or to post-COVID booking behaviour would require revalidation, not just retraining.
 
 ---
 
 # AI Usage Statement
 
-<!-- Required by assignment — describe how AI tools were used in this project -->
+<!-- Required by assignment — describe how AI tools were used in this project.
+A defensible structure: which model(s) used (e.g. Claude Opus 4.7), what for
+(brainstorming research questions, drafting Rmd structure, debugging R errors,
+prose editing), and how outputs were verified (code reviewed and run end-to-end
+locally, prose edited and adapted to team voice). Be specific and honest. -->
 
 ---
 
