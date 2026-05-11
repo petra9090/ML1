@@ -1,7 +1,6 @@
 # Hotel Booking Intelligence Report
-**Course:** Applied Machine Learning and Predictive Modelling I — University of Zurich, FS26  
+**Course:** Applied Machine Learning and Predictive Modelling I — HSLU
 **Team:** Petronela Tabalae · Divya Shori · Lorena Zovkic  
-**Deadline:** June 12, 2026
 
 ---
 
