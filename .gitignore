@@ -2,3 +2,17 @@
 .Rhistory
 .RData
 .Ruserdata
+report_final_cache/
+report_final_files/
+report_final-copy_cache/
+report_final-V2_cache/
+*.log
+*.tex
+.DS_Store
+*.DS_Store
+.RDataTmp
+*_cache/
+*_files/
+*.log
+*.tex
+README.html
