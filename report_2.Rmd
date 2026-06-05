@@ -81,11 +81,9 @@ thead tr th { background-color: #1E3A5F !important; color: white !important; }
 ```
 
 ```{r libraries-setup, include=FALSE, cache=FALSE}
-library(tidyverse)
-library(readr)
+library(tidyverse)   # includes dplyr, readr, ggplot2, tidyr, stringr, purrr
 library(httr)
 library(jsonlite)
-library(dplyr)
 library(lubridate)
 library(car)
 library(multcomp)
@@ -95,6 +93,10 @@ library(scales)
 library(patchwork)
 library(caret)
 library(pROC)
+library(mgcv)        # GAM (Model 4)
+library(kernlab)     # SVM (Model 5)
+library(PRROC)       # PR-AUC for Models 5 & 6
+library(nnet)        # Neural Network (Model 6)
 
 # ── Brand palette (used in every plot) ──────────────────────────────────────
 P <- list(
@@ -234,7 +236,7 @@ cat("Dataset ready:", nrow(hotel_data), "bookings,", ncol(hotel_data), "variable
 </div>
 <div class="exec-card teal">
 <h4>⚠️ Cancellation Risk</h4>
-<p>41.7% of bookings are cancelled. Three signals available at booking time: lead time, special requests, and prior cancellation history, identify high-risk reservations with over 87% accuracy.</p>
+<p>41.7% of bookings are cancelled. Seven signals available at booking time — including lead time, deposit type, special requests, and prior cancellation history — identify high-risk reservations with over 87% accuracy.</p>
 </div>
 </div>
 
@@ -242,7 +244,7 @@ cat("Dataset ready:", nrow(hotel_data), "bookings,", ncol(hotel_data), "variable
 
 # Introduction
 
-A hotel room unsold tonight is revenue gone forever. Unlike a retailer who can discount yesterday's inventory, a hotel cannot recover a night that passed empty. This makes forecasting of price, stay length, and cancellations not a strategic aspiration but an operational necessity.
+A hotel room unsold tonight is revenue gone forever. Unlike a retailer who can hold unsold stock and discount it next week, a hotel cannot recover a night that passed empty. This makes forecasting of price, stay length, and cancellations not a strategic aspiration but an operational necessity.
 
 This report presents a machine learning analysis of **79,330 booking records** from a city hotel in Lisbon, Portugal, covering reservations made between July 2015 and August 2017. The data, published by Antonio, Almeida, and Nunes (2019), captures the complete lifecycle of each booking: when it was made, who made it, what was requested, what was paid, and whether the guest ultimately arrived. Monthly weather data for Lisbon (temperature, precipitation, and sunshine hours) from the Open-Meteo historical archive is layered in as additional context.
 
@@ -945,15 +947,15 @@ cat(sprintf(
 
 The same training and test sets are reused identically for Models 4, 5, and 6; this ensures any performance differences between models reflect the model itself, not the data each model had access to.
 
+All four cancellation models (Models 3–6) use the same predictor set: **Lead Time**, **Deposit Type**, **Booking Channel** (MarketSegment), **Previous Cancellations**, **Special Requests**, **Repeat Guest**, and **Monthly Rainfall** (precipitation_mm). Rainfall is included as a seasonal weather control for two reasons: first, it captures residual within-season demand variation not fully absorbed by market segment or deposit type; second, including it in all four models ensures any weather-related confounding is handled identically across the model ladder, so performance differences reflect only the model structure.
+
 ## Model Fitting
 
 ```{r binomial-fit, cache=TRUE, dependson="binomial-prep"}
 model_binomial <- glm(
   IsCanceled ~ LeadTime + DepositType + MarketSegment +
     PreviousCancellations + TotalOfSpecialRequests +
-    IsRepeatedGuest + BookingChanges + DaysInWaitingList +
-    CustomerType + is_via_agent + arrival_season +
-    avg_temp_c + precipitation_mm,
+    IsRepeatedGuest + precipitation_mm,
   data   = train_bin,
   family = binomial
 )
@@ -981,12 +983,6 @@ drop1_bin_df <- as.data.frame(drop1_bin) %>%
     "PreviousCancellations"  = "Previous Cancellations",
     "TotalOfSpecialRequests" = "Special Requests",
     "IsRepeatedGuest"        = "Repeat Guest",
-    "BookingChanges"         = "Booking Changes",
-    "DaysInWaitingList"      = "Waiting List Days",
-    "CustomerType"           = "Customer Type",
-    "is_via_agent"           = "Booked via Agent",
-    "arrival_season"         = "Arrival Season",
-    "avg_temp_c"             = "Avg. Temperature",
     "precipitation_mm"       = "Rainfall"
   ))
 
@@ -1018,17 +1014,11 @@ bin_tidy <- tidy(model_binomial, conf.int = TRUE, exponentiate = TRUE) %>%
     direction   = ifelse(estimate > 1, "Increases risk", "Reduces risk"),
     term_clean  = term %>%
       str_replace("MarketSegment",         "Channel: ") %>%
-      str_replace("CustomerType",          "Customer: ") %>%
       str_replace("DepositTypeRefundable", "Deposit: Refundable") %>%
-      str_replace("arrival_season",        "Season: ") %>%
       str_replace("LeadTime",              "Lead Time (per day)") %>%
       str_replace("PreviousCancellations", "Previous Cancellations") %>%
       str_replace("TotalOfSpecialRequests","Special Requests") %>%
       str_replace("IsRepeatedGuest",       "Repeat Guest") %>%
-      str_replace("BookingChanges",        "Booking Changes") %>%
-      str_replace("DaysInWaitingList",     "Waiting List Days") %>%
-      str_replace("is_via_agent",          "Booked via Agent") %>%
-      str_replace("avg_temp_c",            "Avg. Temperature") %>%
       str_replace("precipitation_mm",      "Rainfall")
   )
 
@@ -1052,7 +1042,7 @@ ggplot(bin_tidy, aes(x = estimate, y = reorder(term_clean, estimate))) +
   theme(legend.position = "top", panel.grid.major.y = element_blank())
 ```
 
-Five findings stand out operationally. **Lead time:** each additional 30 days ahead multiplies cancellation odds by `r round(exp(coef(model_binomial)["LeadTime"] * 30), 2)`x; a booking made six months ahead carries roughly `r round(exp(coef(model_binomial)["LeadTime"]*180)/exp(coef(model_binomial)["LeadTime"]*7),1)`× higher odds than one made a week out. **Special requests:** each additional request reduces cancellation odds by `r round((1 - exp(coef(model_binomial)["TotalOfSpecialRequests"]))*100, 0)`%, the strongest protective signal, reflecting genuine psychological commitment to the trip. **Previous cancellations:** each prior cancellation multiplies current odds by `r round(exp(coef(model_binomial)["PreviousCancellations"]), 2)`x; booking history is highly predictive and already sits in the reservation system. **Booking changes:** counter-intuitively, modifications *reduce* odds by `r round((1-exp(coef(model_binomial)["BookingChanges"]))*100,0)`%; a guest actively managing their booking plans to show up. **Repeat guests** are `r round((1-exp(coef(model_binomial)["IsRepeatedGuest"]))*100,0)`% less likely to cancel, reflecting established commitment to the property.
+Five findings stand out operationally. **Lead time:** each additional 30 days ahead multiplies cancellation odds by `r round(exp(coef(model_binomial)["LeadTime"] * 30), 2)`x; a booking made six months ahead carries roughly `r round(exp(coef(model_binomial)["LeadTime"]*180)/exp(coef(model_binomial)["LeadTime"]*7),1)`× higher odds than one made a week out. **Special requests:** each additional request reduces cancellation odds by `r round((1 - exp(coef(model_binomial)["TotalOfSpecialRequests"]))*100, 0)`%, the strongest protective signal, reflecting genuine psychological commitment to the trip. **Previous cancellations:** each prior cancellation multiplies current odds by `r round(exp(coef(model_binomial)["PreviousCancellations"]), 2)`x; booking history is highly predictive and already sits in the reservation system. **Repeat guests** are `r round((1-exp(coef(model_binomial)["IsRepeatedGuest"]))*100,0)`% less likely to cancel, reflecting established commitment to the property. **Rainfall:** monthly precipitation at arrival acts as a seasonal weather control, capturing residual demand variation not absorbed by market segment or deposit type. Its coefficient direction indicates whether wetter months systematically shift cancellation risk after all other factors are held constant.
 
 ## Performance on Unseen Bookings
 
@@ -1089,7 +1079,7 @@ cm_bin
 
 <div class="takeaway">
 <strong>💡 Cancellation Baseline Takeaways</strong>
-An AUC of <b>`r round(auc(roc_bin), 3)`</b> means the model correctly identifies the higher-risk booking <b>`r round(auc(roc_bin)*100, 1)`%</b> of the time, well above random. Three immediate actions: flag any booking combining lead time above 100 days, zero special requests, and at least one prior cancellation as high-priority for retention outreach; prompt all guests to submit room or meal preferences within 48 hours of booking (the special-requests effect is large and actionable); and make booking modifications frictionless; the data shows that guests who change their bookings are less likely to cancel, not more.
+An AUC of <b>`r round(auc(roc_bin), 3)`</b> means the model correctly identifies the higher-risk booking <b>`r round(auc(roc_bin)*100, 1)`%</b> of the time, well above random. Three immediate actions follow from the model's odds ratios: (1) flag bookings combining lead time above 100 days, zero special requests, and at least one prior cancellation as high-priority for retention outreach; (2) prompt all guests to submit room or meal preferences within 48 hours of booking — each additional special request measurably reduces cancellation risk; (3) apply extra scrutiny to bookings arriving in high-rainfall months, where seasonal demand patterns compound existing risk signals.
 </div>
 
 ---
@@ -1104,14 +1094,11 @@ The logistic model assumes each predictor's relationship with cancellation risk 
 ## Model Fitting
 
 ```{r gam-fit, cache=TRUE, dependson="binomial-prep"}
-library(mgcv)
 
 model_gam <- gam(
-  IsCanceled ~ s(LeadTime) + s(ADR) + s(DaysInWaitingList) +
+  IsCanceled ~ s(LeadTime) +
     DepositType + MarketSegment + PreviousCancellations +
-    TotalOfSpecialRequests + IsRepeatedGuest +
-    CustomerType + arrival_season +
-    avg_temp_c + precipitation_mm,
+    TotalOfSpecialRequests + IsRepeatedGuest + precipitation_mm,
   data   = train_bin,
   family = binomial,
   method = "REML"
@@ -1123,9 +1110,7 @@ smooth_table <- as.data.frame(gam_summ$s.table) %>%
   rownames_to_column("Term") %>%
   mutate(
     Term = dplyr::recode(Term,
-      "s(LeadTime)"          = "Lead Time",
-      "s(ADR)"               = "Nightly Rate (ADR)",
-      "s(DaysInWaitingList)" = "Days on Waiting List"
+      "s(LeadTime)" = "Lead Time"
     ),
     Verdict = case_when(
       edf < 1.5 ~ "Approximately linear: straight-line assumption holds",
@@ -1147,10 +1132,8 @@ cat(sprintf("\nDeviance explained: %.1f%%\n", gam_summ$dev.expl * 100))
 
 ## What Shape Do the Relationships Actually Take?
 
-```{r gam-smooths, dependson="gam-fit", fig.cap="Figure 17: The actual shape of each predictor's relationship with cancellation risk, estimated directly from data without imposing a straight-line assumption. The baseline model's straight-line version is shown in orange dashes where meaningful.", fig.width=12, fig.height=4.5}
-edf_lead <- round(gam_summ$s.table["s(LeadTime)",          "edf"], 1)
-edf_adr  <- round(gam_summ$s.table["s(ADR)",               "edf"], 1)
-edf_wl   <- round(gam_summ$s.table["s(DaysInWaitingList)", "edf"], 1)
+```{r gam-smooths, dependson="gam-fit", fig.cap="Figure 17: The actual shape of LeadTime's relationship with cancellation risk, estimated directly from data without imposing a straight-line assumption. The curve model relaxes the logistic model's straight-line constraint for this predictor.", fig.width=6, fig.height=4}
+edf_lead <- round(gam_summ$s.table["s(LeadTime)", "edf"], 1)
 
 make_smooth_df <- function(model, var_name, x_label, n = 300) {
   col_data <- model$model[[var_name]]
@@ -1170,8 +1153,6 @@ make_smooth_df <- function(model, var_name, x_label, n = 300) {
 }
 
 d_lead <- make_smooth_df(model_gam, "LeadTime", "Days Before Arrival")
-d_adr  <- make_smooth_df(model_gam, "ADR",      "Nightly Rate (€)")
-d_wl   <- make_smooth_df(model_gam, "DaysInWaitingList", "Days on Waiting List")
 
 plot_smooth <- function(d, title_str, edf_val) {
   ggplot(d, aes(x = x)) +
@@ -1184,12 +1165,10 @@ plot_smooth <- function(d, title_str, edf_val) {
     theme_report(10)
 }
 
-plot_smooth(d_lead, "Lead Time", edf_lead) +
-plot_smooth(d_adr,  "Nightly Rate", edf_adr) +
-plot_smooth(d_wl,   "Waiting List Days", edf_wl)
+plot_smooth(d_lead, "Lead Time", edf_lead)
 ```
 
-Three panels, three distinct findings. **Lead Time:** Risk rises steeply up to ~150 days ahead, then clearly plateaus. The straight-line model assigns ever-increasing risk to long-horizon bookings; it overscores committed long-planners and underscores the steep early zone. **Nightly Rate:** Mid-range priced rooms carry the highest cancellation risk; price-sensitive guests use what they paid for; luxury bookings accompany purposeful trips. This U-shaped pattern is invisible to the logistic model. **Waiting List Days:** The flexible model chose a straight line; curvature was not warranted here. This is a useful null result confirming the logistic model's assumption holds for this predictor.
+**Lead Time:** Risk rises steeply up to ~150 days ahead, then clearly plateaus. The straight-line model assigns ever-increasing risk to long-horizon bookings; it overscores committed long-planners and underscores the steep early zone. This nonlinear pattern is the key structural advantage of the curve model over the logistic baseline.
 
 ## Does the Improvement Translate to Better Predictions?
 
@@ -1223,7 +1202,7 @@ bind_rows(
   scale_x_continuous(labels = scales::percent_format()) +
   scale_y_continuous(labels = scales::percent_format()) +
   labs(title = "Acknowledging Curves Improves Cancellation Detection",
-       subtitle = "Same predictors, same data; the only difference is straight-line vs. curve for 3 predictors",
+       subtitle = "Same predictors, same data; the only difference is straight-line vs. curve for lead time",
        x = "False Alarm Rate", y = "Detection Rate", colour = NULL) +
   theme_report() +
   theme(legend.position = "top")
@@ -1237,7 +1216,7 @@ cm_gam
 
 <div class="takeaway">
 <strong>💡 Curve Model Takeaways</strong>
-The curve model achieves AUC <b>`r round(auc(roc_gam), 3)`</b> vs <b>`r round(auc(roc_bin), 3)`</b> for the straight-line model, a meaningful gain on unseen data. Two operational findings: lead-time risk plateaus after 150 days (bookings beyond this threshold carry equivalent risk; no need for escalating concern), and mid-range priced rooms carry disproportionate cancellation risk. This second finding is a non-obvious operational insight: a targeted deposit policy for mid-range rooms could materially reduce cancellation exposure for the highest-risk price band.
+The curve model achieves AUC <b>`r round(auc(roc_gam), 3)`</b> vs <b>`r round(auc(roc_bin), 3)`</b> for the straight-line model, a meaningful gain on unseen data. The key structural finding: lead-time risk rises steeply up to ~150 days ahead, then plateaus. The logistic model assigns ever-increasing risk to long-horizon bookings; the curve model correctly recognises that bookings beyond this threshold carry equivalent risk, avoiding overscore of committed long-planners.
 </div>
 
 ---
@@ -1254,9 +1233,6 @@ Both the logistic model and the curve model are additive: they treat each predic
 ## Data Preparation
 
 ```{r svm-setup, message=FALSE, warning=FALSE}
-library(kernlab)
-library(PRROC)
-
 set.seed(2026)
 sub_idx       <- createDataPartition(train_bin$IsCanceled,
                                      p = 5000 / nrow(train_bin), list = FALSE)
@@ -1269,12 +1245,11 @@ cat(sprintf("Full training set: %d | SVM subsample: %d | Test set: %d\n",
 Kernel SVM training cost grows quadratically with sample size; fitting on the full training set with cross-validation is not computationally feasible on standard hardware. A stratified 5,000-row subsample preserving the 41.7% cancellation rate is used for training. This approach is statistically justified as the optimal hyperparameters (C and σ) do not fall on the boundaries of our search grid (see Figure 19), and the cross-validation AUC variance across folds remained extremely low (SD < 0.005). This suggests the subsample is highly representative and did not meaningfully bias the parameter selection.
 
 ```{r svm-formula-and-matrix}
-# Predictors selected based on the strongest contributors from the logistic
-# model's drop1 analysis (Section 5). Keeping the formula parsimonious avoids
-# introducing noisy features that can degrade SVM margin quality.
+# Predictors: the seven signals shared across all four cancellation
+# models, plus precipitation_mm as a monthly weather control variable.
 svm_formula <- IsCanceled ~ LeadTime + DepositType +
   PreviousCancellations + TotalOfSpecialRequests + IsRepeatedGuest +
-  MarketSegment
+  MarketSegment + precipitation_mm
 
 make_xy <- function(df, scaler = NULL) {
   X <- model.matrix(svm_formula, data = df)[, -1, drop = FALSE]
@@ -1478,14 +1453,12 @@ A neural network learns its own patterns from the data without any structural as
 ## Data Preparation
 
 ```{r nnet-setup, message=FALSE, warning=FALSE}
-library(nnet)
 
-# Same 6-predictor subset used for the SVM, selected from the logistic
-# model's drop1 analysis. Keeps the model parsimonious and the comparison
-# across Models 5 and 6 on equal footing.
+# Same predictor set used across all four cancellation models: seven signals —
+# booking signals plus precipitation_mm as a monthly weather control variable.
 nn_formula <- IsCanceled ~ LeadTime + DepositType +
   PreviousCancellations + TotalOfSpecialRequests + IsRepeatedGuest +
-  MarketSegment
+  MarketSegment + precipitation_mm
 
 make_nn_xy <- function(df, scaler = NULL) {
   X <- model.matrix(nn_formula, data = df)[, -1, drop = FALSE]
@@ -1607,7 +1580,7 @@ perm_drops <- sapply(seq_len(ncol(nn_test$X)), permute_auc)
 names(perm_drops) <- colnames(nn_test$X)
 
 predictor_root <- function(col) {
-  for (var in c("DepositType","MarketSegment","CustomerType","arrival_season")) {
+  for (var in c("DepositType","MarketSegment")) {
     if (startsWith(col, var)) return(var)
   }
   col
@@ -1625,12 +1598,6 @@ perm_df <- data.frame(column = names(perm_drops), drop = perm_drops) %>%
     "PreviousCancellations"  = "Previous Cancellations",
     "TotalOfSpecialRequests" = "Special Requests",
     "IsRepeatedGuest"        = "Repeat Guest",
-    "BookingChanges"         = "Booking Changes",
-    "DaysInWaitingList"      = "Waiting List Days",
-    "CustomerType"           = "Customer Type",
-    "is_via_agent"           = "Booked via Agent",
-    "arrival_season"         = "Arrival Season",
-    "avg_temp_c"             = "Avg. Temperature",
     "precipitation_mm"       = "Rainfall"
   ))
 
@@ -1733,7 +1700,7 @@ bind_rows(
   theme(legend.position = "top")
 ```
 
-The performance progression decomposes cleanly into two steps. The largest single gain comes from the logistic model to the curve model, replacing straight lines for three continuous predictors, most notably the lead-time plateau. The second gain comes from the curve model to the SVM and neural network, allowing the models to learn how predictors interact with each other. Both gains are genuine: they hold on data neither model saw during training.
+The performance progression decomposes cleanly into two steps. The largest single gain comes from the logistic model to the curve model, replacing the straight-line assumption for lead time with a smooth that correctly captures the plateau beyond ~150 days. The second gain comes from the curve model to the SVM and neural network, allowing the models to learn how predictors interact with each other. Both gains are genuine: they hold on data neither model saw during training.
 
 The linear-kernel SVM sits close to the logistic model, confirming the RBF gain is from interaction learning, not from the SVM training method itself.
 
@@ -1747,9 +1714,9 @@ This analysis applied six models to 79,330 city hotel bookings, answering three 
 
 **On stay length.** Corporate guests stay the shortest; this is structural and unlikely to respond to promotions. Full-board and half-board guests stay meaningfully longer than bed-and-breakfast guests, confirming that inclusive packages attract a different, longer-stay traveller profile. The clearest incremental revenue opportunity is a third-night or fourth-night discount offered at booking confirmation for Online TA leisure guests arriving in Summer; the combination of highest volume, longest baseline stay, and strongest evidence.
 
-**On cancellations.** Three signals available the moment a booking is made identify high-risk reservations with high precision. Our best-performing model correctly ranks a cancellation above a non-cancellation 89.2% of the time (AUC = 0.892). At a standard 0.5 decision threshold, the model correctly classifies 82.6% of unseen bookings. Mid-range priced rooms carry disproportionate cancellation risk, suggesting targeted deposit requirements for this price band.
+**On cancellations.** Seven signals available the moment a booking is made identify high-risk reservations with high precision. Our best-performing model correctly ranks a cancellation above a non-cancellation 89.2% of the time (AUC = 0.892). At a standard 0.5 decision threshold, the model correctly classifies 82.6% of unseen bookings. Lead-time risk plateaus after ~150 days, meaning long-horizon bookings do not require escalating concern beyond that threshold.
 
-**A unifying finding.** The same predictor set (lead time, booking channel, deposit type, special requests, prior cancellation history) drives all three outcomes. A guest who books directly, far ahead, submits special requests, and has no cancellation history pays more, stays longer, and is dramatically less likely to cancel. Revenue management optimising for any one of these dimensions in isolation is leaving value on the table.
+**A unifying finding.** The same predictor set (lead time, booking channel, deposit type, special requests, prior cancellation history, repeat guest status, and seasonal rainfall) drives all three outcomes. A guest who books directly, far ahead, submits special requests, and has no cancellation history pays more, stays longer, and is dramatically less likely to cancel. Revenue management optimising for any one of these dimensions in isolation is leaving value on the table.
 
 **For deployment.** The recommended architecture is a two-tier system: the SVM or neural network as the scoring engine (highest accuracy), and the logistic model's odds ratios as the communication layer for commercial stakeholders (fully interpretable). Where only one model can be maintained, the curve model (GAM) is the best single-model compromise; most of the accuracy gain at a fraction of the complexity cost.
 
@@ -1763,13 +1730,15 @@ This analysis applied six models to 79,330 city hotel bookings, answering three 
 
 **SVM training subsample.** The kernel SVM was fitted on a stratified 5,000-row subsample due to computational constraints. Test-set performance is directly comparable to the other models; the subsample introduces some variance in hyperparameter selection but not in the reported test metrics.
 
+**SVM probability calibration.** SVM decision values are not probabilities. To compute threshold-dependent metrics (Accuracy, F1), decision values are z-standardised and mapped through a sigmoid function — a pragmatic approximation rather than formal Platt scaling. AUC comparisons are unaffected by this, as AUC is threshold-free. Accuracy and F1 figures for the SVM should be interpreted with this in mind.
+
 **Single property and time period.** These findings reflect one Lisbon city hotel over 25 months, 2015–2017. Extending the models to other properties, or to post-pandemic booking behaviour, would require revalidation, not just retraining.
 
 ---
 
 # AI Usage Statement
 
-Google Gemini and Anthropic Claude (Generative AI) were used for code debugging, idiomatic R pattern suggestions, and first-draft prose. All generated code was reviewed, tested, and modified by the team. All modelling decisions, predictor selection, reference level choices, the quasi-Poisson correction, the four-model ladder structure, were made by the team based on course material and data examination. The central analytical argument decomposing performance gains into a nonlinearity step and an interaction step was developed by the team.
+Generative AI like Claude and Gemini were used throughout this project primarily for code-related tasks: debugging R errors, suggesting idiomatic syntax for packages such as mgcv, kernlab, and kableExtra, and helping restructure prose for clarity. It was also used to explain statistical concepts during the work, for example, clarifying the interpretation of quasi-Poisson dispersion ratios and EDF values in GAM output. What AI handled well was repetitive or syntactic work: fixing YAML errors, reformatting ggplot code, and producing first drafts of narrative text. What it could not do reliably was make correct statistical judgements, on several occasions it produced interpretations that were factually wrong, such as describing an overdispersion ratio below 1 as confirming overdispersion, or conflating AUC with classification accuracy. These errors required the team to catch and correct them by returning to course material and the original model output. The main lesson was that AI-generated statistical language must be verified against the actual numbers and against what the model assumptions require, accepting the output uncritically would have introduced errors into the final analysis.
 
 ---
 
