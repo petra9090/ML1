@@ -1274,36 +1274,36 @@ A linear kernel assumes classes are separable by a hyperplane in feature space. 
 The search grid covers 3 values of C for the linear kernel and 3 × 3 combinations of C and σ for the RBF kernel (12 fits × 5 folds = 60 total). Serial evaluation on the 5,000-row subsample completes in approximately 2 minutes; parallelisation is not warranted for a grid of this size.
 
 ```{r svm-cv-tuning, cache=TRUE, message=FALSE, warning=FALSE}
+
 set.seed(2026)
 folds <- createFolds(svm_train_sub$IsCanceled, k = 5, returnTrain = FALSE)
-
 fit_one_fold <- function(val_idx, C, sigma, kernel) {
   Xtr <- train_xy$X[-val_idx, ]; ytr <- train_xy$y[-val_idx]
   Xva <- train_xy$X[ val_idx, ]; yva <- train_xy$y[ val_idx]
-  fit <- if (kernel == "linear") {
-    ksvm(Xtr, ytr, type = "C-svc", kernel = "vanilladot", C = C, scaled = FALSE)
-  } else {
-    ksvm(Xtr, ytr, type = "C-svc", kernel = "rbfdot",
-         kpar = list(sigma = sigma), C = C, scaled = FALSE)
-  }
+  invisible(capture.output(
+    fit <- if (kernel == "linear") {
+      ksvm(Xtr, ytr, type = "C-svc", kernel = "vanilladot", C = C, scaled = FALSE)
+    } else {
+      ksvm(Xtr, ytr, type = "C-svc", kernel = "rbfdot",
+           kpar = list(sigma = sigma), C = C, scaled = FALSE)
+    }
+  ))
   score <- as.numeric(predict(fit, Xva, type = "decision"))
   as.numeric(pROC::auc(yva, score, levels = c("Stay","Cancel"),
                         direction = "<", quiet = TRUE))
 }
-
 cv_auc <- function(C, sigma = NULL, kernel) {
   mean(sapply(folds, fit_one_fold, C = C, sigma = sigma, kernel = kernel))
 }
-
 linear_grid <- expand.grid(C = c(0.1, 1, 10))
 linear_grid$cv_auc <- mapply(function(C) cv_auc(C, kernel = "linear"), linear_grid$C)
-
 rbf_grid <- expand.grid(C = c(0.1, 1, 10), sigma = c(0.01, 0.1, 1))
 rbf_grid$cv_auc <- mapply(function(C, s) cv_auc(C, sigma = s, kernel = "rbf"),
                            rbf_grid$C, rbf_grid$sigma)
 ```
 
-```{r svm-cv-heatmap, fig.cap="Figure 19: Cross-validation accuracy surface for the interaction-learning (RBF) kernel. The interior optimum confirms the search grid is adequate; the best settings are not at the boundary.", fig.width=7, fig.height=4}
+```{r svm-cv-heatmap, message=FALSE, warning=FALSE, fig.cap="Figure 19: Cross-validation accuracy surface for the interaction-learning (RBF) kernel. The interior optimum confirms the search grid is adequate; the best settings are not at the boundary.", fig.width=7, fig.height=4}
+
 ggplot(rbf_grid, aes(x = factor(sigma), y = factor(C), fill = cv_auc)) +
   geom_tile(colour = "white", linewidth = 1.2) +
   geom_text(aes(label = sprintf("%.3f", cv_auc)), colour = "white", size = 4,
@@ -1392,8 +1392,6 @@ The linear-kernel SVM sits close to the logistic model, confirming the AUC gap b
 
 ## Subsample Sensitivity Check
 
-A potential concern with the 5,000-row subsample is whether it constrained model quality. To check this, the best-performing kernel (by CV AUC) is refitted on a 15,000-row stratified subsample and evaluated on the same held-out test set. The test set is rescaled with the 15k training scaler to keep the comparison clean.
-
 ```{r svm-sensitivity-check, cache=TRUE, message=FALSE, warning=FALSE}
 set.seed(2026)
 sub15k_idx    <- createDataPartition(train_bin$IsCanceled,
@@ -1433,6 +1431,8 @@ kable(sensitivity_df, digits = 4,
   kable_styling(full_width = FALSE, font_size = 11) %>%
   row_spec(0, color = "white", background = "#1E3A5F")
 ```
+
+A potential concern with the 5,000-row subsample is whether it constrained model quality. To check this, the best-performing kernel (by CV AUC) is refitted on a 15,000-row stratified subsample and evaluated on the same held-out test set. The test set is rescaled with the 15k training scaler to keep the comparison clean.
 
 <div class="takeaway">
 <strong>💡 SVM Takeaway</strong>
