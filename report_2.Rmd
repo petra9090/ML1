@@ -78,6 +78,12 @@ pre { font-size: 0.78rem; padding: 0.4rem; margin-bottom: 0.4rem; }
 table { font-size: 0.84rem; }
 thead tr th { background-color: #1E3A5F !important; color: white !important; }
 
+/* ── Smaller table captions ─────────────────────────────────── */
+caption {
+  font-size: 0.48rem;
+  color: var(--grey);
+}
+
 ```
 
 ```{r libraries-setup, include=FALSE, cache=FALSE}
@@ -1302,7 +1308,7 @@ rbf_grid$cv_auc <- mapply(function(C, s) cv_auc(C, sigma = s, kernel = "rbf"),
                            rbf_grid$C, rbf_grid$sigma)
 ```
 
-```{r svm-cv-heatmap, message=FALSE, warning=FALSE, fig.cap="Figure 19: Cross-validation accuracy surface for the interaction-learning (RBF) kernel. The interior optimum confirms the search grid is adequate; the best settings are not at the boundary.", fig.width=7, fig.height=4}
+```{r svm-cv-heatmap, message=FALSE, warning=FALSE, fig.cap="Figure 19: Cross-validation accuracy for SVM", fig.width=7, fig.height=4}
 
 ggplot(rbf_grid, aes(x = factor(sigma), y = factor(C), fill = cv_auc)) +
   geom_tile(colour = "white", linewidth = 1.2) +
@@ -1325,7 +1331,7 @@ cat(sprintf("Best Linear: C = %g          → CV AUC = %.3f\n",
             best_lin_row$C, best_lin_row$cv_auc))
 ```
 
-The best RBF configuration (C = `r best_rbf_row$C`, σ = `r best_rbf_row$sigma`) sits in the interior of the search grid, confirming the grid range is adequate and the optimum is not an artefact of boundary truncation. A moderate σ value means the kernel captures mid-range interactions between predictors — neither so narrow that it memorises individual training points, nor so broad that it collapses back toward a linear boundary. The best linear kernel (C = `r best_lin_row$C`) achieves a CV AUC of `r sprintf("%.3f", best_lin_row$cv_auc)` versus `r sprintf("%.3f", best_rbf_row$cv_auc)` for RBF, confirming at the cross-validation stage that interaction learning adds value.
+The best RBF configuration (C = `r best_rbf_row$C`, σ = `r best_rbf_row$sigma`) sits at the boundary of the search grid: the highest regularisation strength and smallest kernel width tested. A small σ means each support vector exerts only local influence, producing a detailed, locally-adapted decision boundary rather than a broad, smooth one — consistent with the data containing sharp, context-dependent risk patterns (e.g. lead time interacting differently with deposit type across segments). The boundary location means the true optimum may lie beyond our grid; however, performance is already plateauing across adjacent cells (0.841 vs. 0.840 at C = 1), and extending the grid would increase computation on the subsample with diminishing returns. The best linear kernel (C = `r best_lin_row$C`) achieves a CV AUC of `r sprintf("%.3f", best_lin_row$cv_auc)` versus `r sprintf("%.3f", best_rbf_row$cv_auc)` for RBF, confirming at the cross-validation stage that interaction learning adds value.
 
 ## Final Models and Test Performance
 
@@ -1378,10 +1384,12 @@ eval_one <- function(prob, label) {
 svm_results <- rbind(eval_one(prob_linear, "SVM (Linear kernel)"),
                      eval_one(prob_rbf,    "SVM (RBF kernel)"))
 kable(svm_results, digits = 4,
-      caption = "Table 4: SVM test-set performance on the full held-out test set. PR-AUC complements ROC-AUC by focusing on positive-class precision, which is particularly relevant here because the hotel's operational cost of a missed cancellation (empty room) differs from a false alarm (unnecessary retention outreach).") %>%
-  kable_styling(full_width = FALSE, font_size = 11) %>%
+      caption = "Table 4: SVM test-set performance on the full held-out test set") %>%
+  kable_styling(full_width = FALSE, font_size = 9) %>%
   row_spec(0, color = "white", background = "#1E3A5F")
 ```
+
+PR-AUC complements ROC-AUC by focusing on positive-class precision, which is particularly relevant here because the hotel's operational cost of a missed cancellation (empty room) differs from a false alarm (unnecessary retention outreach).
 
 ```{r svm-confmat-rbf}
 pred_rbf_class <- factor(ifelse(prob_rbf > 0.5, "Cancel", "Stay"),
@@ -1547,7 +1555,7 @@ nn_grid <- expand.grid(size = c(5, 10, 20), decay = c(0.001, 0.01, 0.1))
 nn_grid$cv_auc <- mapply(cv_auc_nn, nn_grid$size, nn_grid$decay)
 ```
 
-```{r nnet-cv-heatmap, fig.cap="Figure 21: Cross-validation accuracy surface for the neural network. Interior optimum confirms the grid range is adequate.", fig.width=7, fig.height=4}
+```{r nnet-cv-heatmap, fig.cap="Figure 21: Cross-validation accuracy surface for the neural network.", fig.width=7, fig.height=4}
 ggplot(nn_grid, aes(x = factor(decay), y = factor(size), fill = cv_auc)) +
   geom_tile(colour = "white", linewidth = 1.2) +
   geom_text(aes(label = sprintf("%.3f", cv_auc)), colour = "white",
@@ -1558,6 +1566,13 @@ ggplot(nn_grid, aes(x = factor(decay), y = factor(size), fill = cv_auc)) +
        x = "Weight Decay (regularisation)", y = "Hidden Units") +
   theme_report()
 ```
+
+```{r nnet-cv-summary, echo=FALSE}
+nn_best_row <- nn_grid[which.max(nn_grid$cv_auc), ]
+nn_range    <- range(nn_grid$cv_auc)
+```
+
+The cross-validation surface is notably flat: all nine configurations fall within a `r sprintf("%.3f", diff(nn_range))` AUC band (`r sprintf("%.3f", nn_range[1])`–`r sprintf("%.3f", nn_range[2])`), indicating the network's performance is robust to the exact choice of architecture. The best configuration (`r nn_best_row$size` hidden units, decay = `r nn_best_row$decay`) edges out the rest but sits at the grid boundary; given the flatness of the surface, however, extending the grid would offer negligible gains. The only consistent signal is that 5 hidden units slightly underfit — that row is the weakest across all decay values — while 10 or more units capture the available structure equally well. This plateau, at an AUC comparable to the RBF SVM, suggests both flexible models are approaching the ceiling of what these seven predictors can explain.
 
 ## Final Model and Performance
 
