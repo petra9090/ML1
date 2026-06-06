@@ -1316,19 +1316,43 @@ ggplot(rbf_grid, aes(x = factor(sigma), y = factor(C), fill = cv_auc)) +
   theme_report()
 ```
 
+```{r svm-cv-narration, echo=FALSE}
+best_rbf_row <- rbf_grid[which.max(rbf_grid$cv_auc), ]
+best_lin_row <- linear_grid[which.max(linear_grid$cv_auc), ]
+cat(sprintf("Best RBF:    C = %g, σ = %g  → CV AUC = %.3f\n",
+            best_rbf_row$C, best_rbf_row$sigma, best_rbf_row$cv_auc))
+cat(sprintf("Best Linear: C = %g          → CV AUC = %.3f\n",
+            best_lin_row$C, best_lin_row$cv_auc))
+```
+
+The best RBF configuration (C = `r best_rbf_row$C`, σ = `r best_rbf_row$sigma`) sits in the interior of the search grid, confirming the grid range is adequate and the optimum is not an artefact of boundary truncation. A moderate σ value means the kernel captures mid-range interactions between predictors — neither so narrow that it memorises individual training points, nor so broad that it collapses back toward a linear boundary. The best linear kernel (C = `r best_lin_row$C`) achieves a CV AUC of `r sprintf("%.3f", best_lin_row$cv_auc)` versus `r sprintf("%.3f", best_rbf_row$cv_auc)` for RBF, confirming at the cross-validation stage that interaction learning adds value.
+
 ## Final Models and Test Performance
 
 ```{r svm-final-fit, cache=TRUE, message=FALSE, warning=FALSE}
 best_linear <- linear_grid[which.max(linear_grid$cv_auc), ]
 best_rbf    <- rbf_grid[which.max(rbf_grid$cv_auc), ]
 set.seed(2026)
-fit_linear <- ksvm(train_xy$X, train_xy$y, type = "C-svc",
-                   kernel = "vanilladot", C = best_linear$C, scaled = FALSE)
+invisible(capture.output(
+  fit_linear <- ksvm(train_xy$X, train_xy$y, type = "C-svc",
+                     kernel = "vanilladot", C = best_linear$C, scaled = FALSE)
+))
 set.seed(2026)
-fit_rbf <- ksvm(train_xy$X, train_xy$y, type = "C-svc",
-                kernel = "rbfdot", kpar = list(sigma = best_rbf$sigma),
-                C = best_rbf$C, scaled = FALSE)
+invisible(capture.output(
+  fit_rbf <- ksvm(train_xy$X, train_xy$y, type = "C-svc",
+                  kernel = "rbfdot", kpar = list(sigma = best_rbf$sigma),
+                  C = best_rbf$C, scaled = FALSE)
+))
 ```
+
+```{r svm-support-vectors, echo=FALSE}
+cat(sprintf("Linear kernel: %d support vectors (%.1f%% of training data)\n",
+            fit_linear@nSV, fit_linear@nSV / nrow(train_xy$X) * 100))
+cat(sprintf("RBF kernel:    %d support vectors (%.1f%% of training data)\n",
+            fit_rbf@nSV, fit_rbf@nSV / nrow(train_xy$X) * 100))
+```
+
+The RBF kernel uses `r fit_rbf@nSV` support vectors (`r sprintf("%.1f", fit_rbf@nSV / nrow(train_xy$X) * 100)`% of training data), compared to `r fit_linear@nSV` (`r sprintf("%.1f", fit_linear@nSV / nrow(train_xy$X) * 100)`%) for the linear kernel. A higher support-vector count signals a more complex decision boundary, consistent with the RBF kernel learning interaction patterns that require more training points to define.
 
 ```{r svm-test-evaluation}
 score_to_prob <- function(s) plogis(as.numeric(scale(s)))
@@ -1354,9 +1378,16 @@ eval_one <- function(prob, label) {
 svm_results <- rbind(eval_one(prob_linear, "SVM (Linear kernel)"),
                      eval_one(prob_rbf,    "SVM (RBF kernel)"))
 kable(svm_results, digits = 4,
-      caption = "Table 4: SVM test-set performance: full held-out test set.") %>%
+      caption = "Table 4: SVM test-set performance on the full held-out test set. PR-AUC complements ROC-AUC by focusing on positive-class precision, which is particularly relevant here because the hotel's operational cost of a missed cancellation (empty room) differs from a false alarm (unnecessary retention outreach).") %>%
   kable_styling(full_width = FALSE, font_size = 11) %>%
   row_spec(0, color = "white", background = "#1E3A5F")
+```
+
+```{r svm-confmat-rbf}
+pred_rbf_class <- factor(ifelse(prob_rbf > 0.5, "Cancel", "Stay"),
+                         levels = c("Stay", "Cancel"))
+cm_rbf <- caret::confusionMatrix(pred_rbf_class, test_xy$y, positive = "Cancel")
+cm_rbf
 ```
 
 ```{r svm-roc-plot, fig.cap="Figure 20: ROC curves for both SVM kernels alongside the logistic and curve model baselines, all evaluated on the identical held-out test set.", fig.width=7, fig.height=5.5}
@@ -1388,7 +1419,7 @@ bind_rows(
   theme(legend.position = "top")
 ```
 
-The linear-kernel SVM sits close to the logistic model, confirming the AUC gap between linear and RBF kernels is due to interaction learning, not the SVM training method itself.
+The linear-kernel SVM sits close to the logistic model, confirming the AUC gap between linear and RBF kernels is due to interaction learning, not the SVM training method itself. The RBF kernel's advantage likely stems from capturing context-dependent patterns such as the interplay between lead time and deposit type — a long lead time paired with a non-refundable deposit carries a very different risk profile than the same lead time with no deposit. The neural network's permutation importance analysis (Section 8) confirms that these are precisely the predictors whose value is most context-dependent.
 
 ## Subsample Sensitivity Check
 
@@ -1402,14 +1433,16 @@ test_xy_15k   <- make_xy(test_bin, scaler = train_xy_15k$scaler)
 
 best_kernel <- if (max(rbf_grid$cv_auc) >= max(linear_grid$cv_auc)) "rbf" else "linear"
 
-fit_15k <- if (best_kernel == "rbf") {
-  ksvm(train_xy_15k$X, train_xy_15k$y, type = "C-svc",
-       kernel = "rbfdot", kpar = list(sigma = best_rbf$sigma),
-       C = best_rbf$C, scaled = FALSE)
-} else {
-  ksvm(train_xy_15k$X, train_xy_15k$y, type = "C-svc",
-       kernel = "vanilladot", C = best_linear$C, scaled = FALSE)
-}
+invisible(capture.output(
+  fit_15k <- if (best_kernel == "rbf") {
+    ksvm(train_xy_15k$X, train_xy_15k$y, type = "C-svc",
+         kernel = "rbfdot", kpar = list(sigma = best_rbf$sigma),
+         C = best_rbf$C, scaled = FALSE)
+  } else {
+    ksvm(train_xy_15k$X, train_xy_15k$y, type = "C-svc",
+         kernel = "vanilladot", C = best_linear$C, scaled = FALSE)
+  }
+))
 
 dec_15k  <- as.numeric(predict(fit_15k, test_xy_15k$X, type = "decision"))
 prob_15k <- score_to_prob(dec_15k)
@@ -1432,13 +1465,12 @@ kable(sensitivity_df, digits = 4,
   row_spec(0, color = "white", background = "#1E3A5F")
 ```
 
-A potential concern with the 5,000-row subsample is whether it constrained model quality. To check this, the best-performing kernel (by CV AUC) is refitted on a 15,000-row stratified subsample and evaluated on the same held-out test set. The test set is rescaled with the 15k training scaler to keep the comparison clean.
+A potential concern with the 5,000-row subsample is whether it constrained model quality. To check this, the best-performing kernel (by CV AUC) is refitted on a 15,000-row stratified subsample and evaluated on the same held-out test set. The test set is rescaled with the 15k training scaler to keep the comparison clean. The AUC delta of `r sprintf("%.4f", auc_15k - auc_5k)` when tripling the training data suggests the 5,000-row subsample was `r ifelse(abs(auc_15k - auc_5k) < 0.005, "sufficient: the hyperparameters selected on 5,000 rows generalise well, and additional data does not materially change the decision boundary", "slightly constraining: additional data yields a modest improvement, though the hyperparameters transfer well")`.
 
 <div class="takeaway">
 <strong>💡 SVM Takeaway</strong>
-The interaction-learning (RBF) SVM achieves AUC <b>`r round(auc(roc_rbf), 3)`</b> vs. <b>`r round(auc(roc_lin), 3)`</b> for the linear kernel. The gap represents the commercial value of modelling how predictors interact; a long lead time means different things in different segments. For a hotel deploying a risk-scoring system, the RBF kernel is the right engine.
+The interaction-learning (RBF) SVM achieves AUC <b>`r round(auc(roc_rbf), 3)`</b> vs. <b>`r round(auc(roc_lin), 3)`</b> for the linear kernel. The gap represents the commercial value of modelling how predictors interact; a long lead time means different things in different segments. The RBF model uses <b>`r fit_rbf@nSV`</b> support vectors to define its decision boundary, reflecting the complexity of these learned interactions. For a hotel deploying a risk-scoring system, the RBF kernel is the right engine.
 </div>
-
 ---
 
 # Model 6: The Most Flexible Approach: Neural Network {#nnet}
