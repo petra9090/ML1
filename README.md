@@ -1,6 +1,5 @@
 # Understanding Your Guests: A Data-Driven Guide to Pricing, Stay Length, and Cancellations
-**City Hotel Lisbon — Booking Intelligence Report**
-
+**City Hotel Lisbon — Booking Intelligence Report**  
 **Course:** Applied Machine Learning and Predictive Modelling I — HSLU  
 **Team:** Petronela Tabalae · Divya Shori · Lorena Zovkic
 
@@ -31,32 +30,32 @@ Three business questions drive the analysis:
 | 5 | Support Vector Machine | Cancellation (interactions) | `kernlab::ksvm()` with subsample sensitivity check |
 | 6 | Neural Network | Cancellation (flexible) | `nnet::nnet()` |
 
-All models trained on 80% of the data and evaluated on the same held-out 20% test set. Models 3–6 use an identical predictor set — Lead Time, Deposit Type, Market Segment, Previous Cancellations, Special Requests, Repeat Guest, and Monthly Rainfall — ensuring performance differences reflect only model structure.
+All models trained on 80% of the data and evaluated on the same held-out 20% test set. Models 3–6 use an identical predictor set — Lead Time, Deposit Type, Market Segment, Previous Cancellations, Special Requests, Repeat Guest, and Monthly Rainfall — ensuring any performance differences reflect model structure only.
 
 ---
 
 ## Repository Structure
 
 ```
-ML 1 Project/
-├── data/
-│   ├── H2.csv                       # Hotel booking dataset (source below)
-│   └── weather_raw.rds              # Cached Lisbon weather data
-├── report-093c14cb.Rmd              # Main analysis — knit this to reproduce
-├── report-093c14cb.html             # Rendered HTML report (submission ready)
+ML1/
+├── H2.csv                        # Hotel booking dataset (source below)
+├── weather_lisbon.rds            # Cached Lisbon monthly weather data
+├── hotel_booking_report.Rmd      # Main analysis — knit this to reproduce
+├── hotel_booking_report.html     # Rendered HTML report (submission ready)
 ├── README.md
-└── ML1.Rproj
+├── LICENSE
+└── .gitignore
 ```
 
 ---
 
 ## How to Run
 
-1. Open `ML1.Rproj` in RStudio
-2. Ensure `H2.csv` and `weather_raw.rds` are in the `data/` folder
-3. Knit `report-093c14cb.Rmd` to HTML
+1. Open the project in RStudio
+2. Ensure `H2.csv` and `weather_lisbon.rds` are in the project root
+3. Knit `hotel_booking_report.Rmd` to HTML
 
-> If `weather_raw.rds` is missing, the script will fetch it automatically from the Open-Meteo API on first run and cache it locally.
+> If `weather_lisbon.rds` is missing, the script will fetch it automatically from the Open-Meteo API on first run and cache it locally.
 
 **Required R packages:**  
 `tidyverse`, `httr`, `jsonlite`, `lubridate`, `car`, `multcomp`, `broom`, `kableExtra`, `scales`, `patchwork`, `caret`, `pROC`, `mgcv`, `kernlab`, `PRROC`, `nnet`
