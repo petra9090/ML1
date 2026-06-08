@@ -73,6 +73,16 @@ Since this is real hotel data, all elements pertaining to hotel or customer iden
 
 ---
 
+## Authors
+
+| Name | Contribution |
+|------|-------------|
+| Divya Shori | Models 1 & 2 (Linear Model, Poisson GLM), EDA |
+| Lorena Zovkic | Models 3 & 4 (Logistic Regression, GAM), data preparation |
+| Petronela Tabalae | Models 5 & 6 (SVM, Neural Network), model comparison |
+
+---
+
 ## Data Dictionary
 
 | Variable | Type | Description |
