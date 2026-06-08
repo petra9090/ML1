@@ -1,5 +1,6 @@
 # Understanding Your Guests: A Data-Driven Guide to Pricing, Stay Length, and Cancellations
 **City Hotel Lisbon — Booking Intelligence Report**
+
 **Course:** Applied Machine Learning and Predictive Modelling I — HSLU  
 **Team:** Petronela Tabalae · Divya Shori · Lorena Zovkic
 
