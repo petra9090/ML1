@@ -1785,13 +1785,15 @@ This analysis applied six models to 79,330 city hotel bookings, answering three 
 
 # AI Usage Statement
 
-Generative AI like Claude and Gemini were used throughout this project primarily for code-related tasks: debugging R errors, suggesting idiomatic syntax for packages such as mgcv, kernlab, and kableExtra, and helping restructure prose for clarity. It was also used to explain statistical concepts during the work, for example, clarifying the interpretation of quasi-Poisson dispersion ratios and EDF values in GAM output. What AI handled well was repetitive or syntactic work: fixing YAML errors, reformatting ggplot code, and producing first drafts of narrative text. What it could not do reliably was make correct statistical judgements, on several occasions it produced interpretations that were factually wrong, such as describing an overdispersion ratio below 1 as confirming overdispersion, or conflating AUC with classification accuracy. These errors required the team to catch and correct them by returning to course material and the original model output. The main lesson was that AI-generated statistical language must be verified against the actual numbers and against what the model assumptions require, accepting the output uncritically would have introduced errors into the final analysis.
+Generative AI (Claude, Gemini) was used for code debugging, R syntax suggestions, and first-draft prose. It explained statistical concepts clearly but produced unreliable statistical judgements, on several occasions generating factually wrong interpretations, such as misreading an overdispersion ratio or conflating AUC with accuracy. All AI output was verified against course material and model results before
+use. The key lesson: AI is a useful coding and drafting aid, but statistical interpretation requires human judgement.
 
 ---
 
 # References
 
+<div style="font-size: 0.85rem; line-height: 1.6;">
 Antonio, N., de Almeida, A., & Nunes, L. (2019). Hotel booking demand datasets. *Data in Brief*, 22, 41–49. https://doi.org/10.1016/j.dib.2018.11.126
-
+ 
 Open-Meteo Historical Weather API. Retrieved from https://open-meteo.com
-
+</div>
