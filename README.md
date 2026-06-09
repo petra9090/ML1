@@ -41,7 +41,7 @@ ML1/
 ├── H2.csv                        # Hotel booking dataset (source below)
 ├── weather_lisbon.rds            # Cached Lisbon monthly weather data
 ├── hotel_booking_report.Rmd      # Main analysis — knit this to reproduce
-├── hotel_booking_report.html     # Rendered HTML report (submission ready)
+├── hotel_booking_report.html     # Rendered HTML report
 ├── README.md
 ├── LICENSE
 └── .gitignore
